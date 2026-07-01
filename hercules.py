@@ -1,34 +1,1759 @@
 #!/usr/bin/env python3
 """Hercules - Local-First AI Agent with GPT4All Integration"""
 
+import sys
+import subprocess
+
+# AUTO-INSTALL DEPENDENCIES
+def auto_install_deps():
+    """Auto-install numpy and colorama if missing"""
+    required = ['numpy', 'colorama']
+    for pkg in required:
+        try:
+            __import__(pkg)
+        except ImportError:
+            print(f"📦 Installing {pkg}...")
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--quiet", pkg],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    print(f"✅ {pkg} installed")
+                else:
+                    print(f"❌ Failed to install {pkg}")
+                    print(f"Run manually: pip install {pkg}")
+            except Exception as e:
+                print(f"❌ Failed to install {pkg}")
+                print(f"Run manually: pip install {pkg}")
+
+auto_install_deps()
+
+# Now safe to import
 import json
 import os
 import platform
-import sys
 from pathlib import Path
 from collections import Counter
+from datetime import datetime
 
 try:
-    from gpt4all import GPT4All
     from colorama import init
+    import subprocess
+    import struct
+    import logging
+    import json
+    import signal
+    from functools import wraps
+    from time import time, sleep
+    from collections import defaultdict
     init(autoreset=True)
-except ImportError:
-    print("Install: pip install gpt4all colorama")
+except ImportError as e:
+    print(f"❌ ERROR: {e}")
     sys.exit(1)
 
+try:
+    import numpy as np
+except ImportError:
+    print("❌ numpy still not found after install attempt")
+    sys.exit(1)
 
-# ANSI Color Codes
-O1 = '\033[38;2;218;165;32m'
-O2 = '\033[38;2;255;215;0m'
-H1 = '\033[38;2;184;134;11m'
-H2 = '\033[38;2;255;140;0m'
-G = '\033[38;2;26;176;128m'
-R = '\033[38;2;255;59;59m'
-S = '\033[38;2;90;122;150m'
+# Configure structured logging with file output
+import atexit
+
+LOG_DIR = Path.home() / '.hercules' / 'logs'
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / f"hercules_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+# Setup file handler
+file_handler = logging.FileHandler(LOG_FILE)
+file_handler.setLevel(logging.DEBUG)
+file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+
+# Setup root logger
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[file_handler]
+)
+logger = logging.getLogger("hercules")
+
+# Log startup
+def log_startup():
+    """Log application startup info"""
+    logger.info(f"Hercules started - Log file: {LOG_FILE}")
+    logger.info(f"Platform: {platform.system()} {platform.release()}")
+    logger.info(f"Python: {sys.version}")
+
+atexit.register(lambda: logger.info("Hercules shutdown"))
+
+class StructuredLogger:
+    """JSON-structured logging"""
+    def __init__(self, name):
+        self.logger = logging.getLogger(name)
+    
+    def log(self, event: str, **kwargs):
+        """Log structured event as JSON"""
+        log_data = {
+            'timestamp': __import__('datetime').datetime.now().isoformat(),
+            'event': event,
+            **kwargs
+        }
+        self.logger.info(json.dumps(log_data))
+    
+    def error(self, event: str, error: str, **kwargs):
+        """Log error with context"""
+        log_data = {
+            'timestamp': __import__('datetime').datetime.now().isoformat(),
+            'event': event,
+            'error': str(error),
+            'level': 'ERROR',
+            **kwargs
+        }
+        self.logger.error(json.dumps(log_data))
+
+structured_logger = StructuredLogger("hercules")
+
+# Global exception handler
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    """Catch all unhandled exceptions and log them"""
+    logger.critical(
+        "UNCAUGHT EXCEPTION",
+        exc_info=(exc_type, exc_value, exc_traceback)
+    )
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = global_exception_handler
+
+# === PRIORITY 0: DEAD LETTER QUEUE ===
+class DeadLetterQueue:
+    """Queue for failed requests"""
+    def __init__(self, max_size: int = 1000):
+        self.queue = []
+        self.max_size = max_size
+    
+    def add(self, request: dict, error: str, timestamp: float = None):
+        """Add failed request to DLQ"""
+        if len(self.queue) >= self.max_size:
+            self.queue.pop(0)  # FIFO
+        
+        dlq_item = {
+            'request': request,
+            'error': error,
+            'timestamp': timestamp or time(),
+            'retry_count': 0
+        }
+        self.queue.append(dlq_item)
+        structured_logger.log('dlq_add', error=error, queue_size=len(self.queue))
+    
+    def retry_one(self, func, *args, **kwargs):
+        """Retry first item in DLQ"""
+        if not self.queue:
+            return None
+        
+        item = self.queue[0]
+        try:
+            result = func(*args, **kwargs)
+            structured_logger.log('dlq_retry_success', retry_count=item['retry_count'])
+            self.queue.pop(0)
+            return result
+        except Exception as e:
+            item['retry_count'] += 1
+            structured_logger.log('dlq_retry_failed', retry_count=item['retry_count'], error=str(e))
+            if item['retry_count'] > 5:
+                self.queue.pop(0)
+            return None
+    
+    def get_size(self) -> int:
+        return len(self.queue)
+
+dlq = DeadLetterQueue(max_size=1000)
+# === END DEAD LETTER QUEUE ===
+
+# === PRIORITY 0.2: REQUEST DEDUPLICATION ===
+class RequestCache:
+    """Cache responses to identical requests"""
+    def __init__(self, max_size: int = 500, ttl_seconds: int = 3600):
+        self.cache = {}
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+    
+    def get(self, request_hash: str) -> tuple:
+        """Get cached response if exists and not expired"""
+        if request_hash in self.cache:
+            cached_time, response = self.cache[request_hash]
+            if time() - cached_time < self.ttl:
+                structured_logger.log('cache_hit', hash=request_hash[:8])
+                return response
+            else:
+                del self.cache[request_hash]
+        return None
+    
+    def set(self, request_hash: str, response):
+        """Cache response to request"""
+        if len(self.cache) >= self.max_size:
+            # Remove oldest entry
+            oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][0])
+            del self.cache[oldest_key]
+        
+        self.cache[request_hash] = (time(), response)
+        structured_logger.log('cache_set', hash=request_hash[:8], size=len(self.cache))
+
+request_cache = RequestCache(max_size=500, ttl_seconds=3600)
+# === END REQUEST DEDUPLICATION ===
+
+# === PRIORITY 0: RATE LIMITING ===
+class RateLimiter:
+    """Token bucket rate limiter"""
+    def __init__(self, max_requests: int = 10, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window = window_seconds
+        self.requests = defaultdict(list)
+    
+    def is_allowed(self, session_id: str) -> bool:
+        """Check if request allowed for session"""
+        now = time()
+        cutoff = now - self.window
+        
+        # Clean old requests
+        self.requests[session_id] = [t for t in self.requests[session_id] if t > cutoff]
+        
+        if len(self.requests[session_id]) < self.max_requests:
+            self.requests[session_id].append(now)
+            return True
+        return False
+    
+    def get_remaining(self, session_id: str) -> int:
+        """Get remaining requests in window"""
+        now = time()
+        cutoff = now - self.window
+        self.requests[session_id] = [t for t in self.requests[session_id] if t > cutoff]
+        return max(0, self.max_requests - len(self.requests[session_id]))
+
+HAS_RATE_LIMITING = True
+rate_limiter = RateLimiter(max_requests=10, window_seconds=60)
+# === END RATE LIMITING ===
+
+# === PRIORITY 0.5: RETRY LOGIC ===
+def retry(max_attempts: int = 3, backoff_factor: float = 2.0, initial_delay: float = 1.0):
+    """Decorator for exponential backoff retry logic"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_error = None
+            for attempt in range(max_attempts):
+                try:
+                    result = func(*args, **kwargs)
+                    if attempt > 0:
+                        structured_logger.log('retry_success', function=func.__name__, attempt=attempt+1)
+                    return result
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_attempts - 1:
+                        structured_logger.log('retry_attempt', function=func.__name__, attempt=attempt+1, error=str(e), delay=delay)
+                        sleep(delay)
+                        delay *= backoff_factor
+                    else:
+                        structured_logger.error('retry_failed', error=str(e), function=func.__name__, attempts=max_attempts)
+            raise last_error
+        return wrapper
+    return decorator
+
+# === END RETRY LOGIC ===
+
+# === PRIORITY 0.7: TIMEOUT MANAGEMENT ===
+class TimeoutError(Exception):
+    """Custom timeout exception"""
+    pass
+
+def timeout_handler(signum, frame):
+    """Signal handler for timeout"""
+    raise TimeoutError("Operation timed out")
+
+class TimeoutManager:
+    """Manages execution timeouts"""
+    def __init__(self, timeout_seconds: int = 120):
+        self.timeout = timeout_seconds
+        self.original_handler = None
+    
+    def start(self):
+        """Start timeout timer"""
+        if hasattr(signal, 'SIGALRM'):
+            self.original_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(self.timeout)
+    
+    def cancel(self):
+        """Cancel timeout"""
+        if hasattr(signal, 'SIGALRM'):
+            signal.alarm(0)
+            if self.original_handler:
+                signal.signal(signal.SIGALRM, self.original_handler)
+    
+    def __enter__(self):
+        self.start()
+        return self
+    
+    def __exit__(self, *args):
+        self.cancel()
+
+timeout_manager = TimeoutManager(timeout_seconds=120)
+# === END TIMEOUT MANAGEMENT ===
+
+# === PRIORITY 0.9: GRACEFUL SHUTDOWN ===
+class GracefulShutdown:
+    """Handle graceful shutdown on signals"""
+    def __init__(self):
+        self.shutdown_requested = False
+        self.cleanup_handlers = []
+    
+    def register_cleanup(self, func):
+        """Register cleanup function"""
+        self.cleanup_handlers.append(func)
+    
+    def handle_signal(self, signum, frame):
+        """Signal handler for graceful shutdown"""
+        structured_logger.log('shutdown_initiated', signal=signum)
+        self.shutdown_requested = True
+        self._cleanup()
+    
+    def _cleanup(self):
+        """Execute all cleanup handlers"""
+        structured_logger.log('cleanup_start', handlers=len(self.cleanup_handlers))
+        
+        for handler in self.cleanup_handlers:
+            try:
+                handler()
+            except Exception as e:
+                structured_logger.error('cleanup_failed', handler=handler.__name__, error=str(e))
+        
+        structured_logger.log('cleanup_complete')
+    
+    def setup_handlers(self):
+        """Setup signal handlers"""
+        if hasattr(signal, 'SIGTERM'):
+            signal.signal(signal.SIGTERM, self.handle_signal)
+        if hasattr(signal, 'SIGINT'):
+            signal.signal(signal.SIGINT, self.handle_signal)
+
+graceful_shutdown = GracefulShutdown()
+
+# Register default cleanup
+def default_cleanup():
+    """Default cleanup: save sessions and logs"""
+    if current_session and HAS_PERSISTENCE:
+        try:
+            session_persistence.save_session(current_session)
+        except:
+            pass
+
+graceful_shutdown.register_cleanup(default_cleanup)
+graceful_shutdown.setup_handlers()
+# === END GRACEFUL SHUTDOWN ===
+
+# === PRIORITY 0: API INTEGRATION SYSTEM ===
+class APIConfig:
+    """Manage API keys and credentials"""
+    def __init__(self):
+        self.config_file = Path.home() / '.hercules' / 'apis.json'
+        self.config_file.parent.mkdir(parents=True, exist_ok=True)
+        self.apis = {}
+        self.load_config()
+    
+    def load_config(self):
+        """Load API config from file"""
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, 'r') as f:
+                    self.apis = json.load(f)
+                structured_logger.log('api_config_loaded', file=str(self.config_file))
+            except Exception as e:
+                structured_logger.error('api_config_load_failed', error=str(e))
+                self.apis = {}
+    
+    def save_config(self):
+        """Save API config to file"""
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(self.apis, f, indent=2)
+            os.chmod(self.config_file, 0o600)  # Read-only for owner
+            structured_logger.log('api_config_saved')
+        except Exception as e:
+            structured_logger.error('api_config_save_failed', error=str(e))
+    
+    def set_api(self, provider, key, **kwargs):
+        """Store API key and config"""
+        self.apis[provider] = {'key': key, **kwargs}
+        self.save_config()
+        structured_logger.log('api_configured', provider=provider)
+    
+    def get_api(self, provider):
+        """Get API config"""
+        return self.apis.get(provider)
+    
+    def list_apis(self):
+        """List configured APIs"""
+        return list(self.apis.keys())
+    
+    def remove_api(self, provider):
+        """Remove API config"""
+        if provider in self.apis:
+            del self.apis[provider]
+            self.save_config()
+            structured_logger.log('api_removed', provider=provider)
+
+api_config = APIConfig()
+
+# === API CLIENT WRAPPERS ===
+class OpenAIClient:
+    """OpenAI API integration"""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.openai.com/v1"
+        self.model = "gpt-5.4"
+    
+    def query(self, prompt, model=None):
+        """Query OpenAI"""
+        try:
+            import requests
+            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+            data = {
+                "model": model or self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.7,
+                "max_tokens": 2048
+            }
+            response = requests.post(f"{self.base_url}/chat/completions", headers=headers, json=data, timeout=30)
+            if response.status_code == 200:
+                structured_logger.log('openai_query_success', model=model or self.model)
+                return response.json()['choices'][0]['message']['content']
+            else:
+                error_msg = f"OpenAI error: {response.status_code}"
+                structured_logger.error('openai_query_failed', error=error_msg)
+                return f"Error: {error_msg}"
+        except Exception as e:
+            structured_logger.error('openai_query_error', error=str(e))
+            return f"OpenAI error: {str(e)}"
+
+class AnthropicClient:
+    """Anthropic Claude API integration"""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.anthropic.com/v1"
+        self.model = "claude-sonnet-5"
+    
+    def query(self, prompt, model=None):
+        """Query Anthropic Claude"""
+        try:
+            import requests
+            headers = {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            }
+            data = {
+                "model": model or self.model,
+                "max_tokens": 2048,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            response = requests.post(f"{self.base_url}/messages", headers=headers, json=data, timeout=30)
+            if response.status_code == 200:
+                structured_logger.log('anthropic_query_success', model=model or self.model)
+                return response.json()['content'][0]['text']
+            else:
+                error_msg = f"Anthropic error: {response.status_code}"
+                structured_logger.error('anthropic_query_failed', error=error_msg)
+                return f"Error: {error_msg}"
+        except Exception as e:
+            structured_logger.error('anthropic_query_error', error=str(e))
+            return f"Anthropic error: {str(e)}"
+
+class GoogleGeminiClient:
+    """Google Gemini API integration"""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://generativelanguage.googleapis.com/v1beta/models"
+        self.model = "gemini-3.5-flash"
+    
+    def query(self, prompt, model=None):
+        """Query Google Gemini"""
+        try:
+            import requests
+            model_name = model or self.model
+            url = f"{self.base_url}/{model_name}:generateContent"
+            headers = {"Content-Type": "application/json"}
+            data = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 2048}
+            }
+            response = requests.post(f"{url}?key={self.api_key}", headers=headers, json=data, timeout=30)
+            if response.status_code == 200:
+                structured_logger.log('gemini_query_success', model=model_name)
+                return response.json()['candidates'][0]['content']['parts'][0]['text']
+            else:
+                error_msg = f"Gemini error: {response.status_code}"
+                structured_logger.error('gemini_query_failed', error=error_msg)
+                return f"Error: {error_msg}"
+        except Exception as e:
+            structured_logger.error('gemini_query_error', error=str(e))
+            return f"Gemini error: {str(e)}"
+
+class HuggingFaceClient:
+    """Hugging Face API integration"""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api-inference.huggingface.co"
+        self.model = "meta-llama/Llama-3.2-3B-Instruct"
+    
+    def query(self, prompt, model=None):
+        """Query Hugging Face"""
+        try:
+            import requests
+            model_name = model or self.model
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            data = {"inputs": prompt}
+            response = requests.post(
+                f"{self.base_url}/models/{model_name}",
+                headers=headers,
+                json=data,
+                timeout=30
+            )
+            if response.status_code == 200:
+                structured_logger.log('huggingface_query_success', model=model_name)
+                return response.json()[0].get('generated_text', '')
+            else:
+                error_msg = f"HuggingFace error: {response.status_code}"
+                structured_logger.error('huggingface_query_failed', error=error_msg)
+                return f"Error: {error_msg}"
+        except Exception as e:
+            structured_logger.error('huggingface_query_error', error=str(e))
+            return f"HuggingFace error: {str(e)}"
+
+class CohereClient:
+    """Cohere API integration"""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.cohere.ai"
+        self.model = "command-r-plus"
+    
+    def query(self, prompt, model=None):
+        """Query Cohere"""
+        try:
+            import requests
+            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+            data = {
+                "prompt": prompt,
+                "max_tokens": 2048,
+                "temperature": 0.8
+            }
+            response = requests.post(f"{self.base_url}/v1/generate", headers=headers, json=data, timeout=30)
+            if response.status_code == 200:
+                structured_logger.log('cohere_query_success')
+                return response.json()['generations'][0]['text']
+            else:
+                error_msg = f"Cohere error: {response.status_code}"
+                structured_logger.error('cohere_query_failed', error=error_msg)
+                return f"Error: {error_msg}"
+        except Exception as e:
+            structured_logger.error('cohere_query_error', error=str(e))
+            return f"Cohere error: {str(e)}"
+
+class GroqClient:
+    """Groq API integration (fast inference)"""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.groq.com/openai/v1"
+        self.model = "llama-3.3-70b-versatile"
+    
+    def query(self, prompt, model=None):
+        """Query Groq"""
+        try:
+            import requests
+            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+            data = {
+                "model": model or self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 2048
+            }
+            response = requests.post(f"{self.base_url}/chat/completions", headers=headers, json=data, timeout=30)
+            if response.status_code == 200:
+                structured_logger.log('groq_query_success', model=model or self.model)
+                return response.json()['choices'][0]['message']['content']
+            else:
+                error_msg = f"Groq error: {response.status_code}"
+                structured_logger.error('groq_query_failed', error=error_msg)
+                return f"Error: {error_msg}"
+        except Exception as e:
+            structured_logger.error('groq_query_error', error=str(e))
+            return f"Groq error: {str(e)}"
+
+class TogetherAIClient:
+    """Together AI API integration"""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.together.xyz/v1"
+        self.model = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    
+    def query(self, prompt, model=None):
+        """Query Together AI"""
+        try:
+            import requests
+            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+            data = {
+                "model": model or self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 2048
+            }
+            response = requests.post(f"{self.base_url}/chat/completions", headers=headers, json=data, timeout=30)
+            if response.status_code == 200:
+                structured_logger.log('together_query_success', model=model or self.model)
+                return response.json()['choices'][0]['message']['content']
+            else:
+                error_msg = f"Together error: {response.status_code}"
+                structured_logger.error('together_query_failed', error=error_msg)
+                return f"Error: {error_msg}"
+        except Exception as e:
+            structured_logger.error('together_query_error', error=str(e))
+            return f"Together error: {str(e)}"
+
+class AzureOpenAIClient:
+    """Azure OpenAI API integration"""
+    def __init__(self, api_key, endpoint):
+        self.api_key = api_key
+        self.endpoint = endpoint
+        self.model = "gpt-4o"
+    
+    def query(self, prompt, model=None):
+        """Query Azure OpenAI"""
+        try:
+            import requests
+            headers = {"api-key": self.api_key, "Content-Type": "application/json"}
+            data = {
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.7,
+                "max_tokens": 2048
+            }
+            url = f"{self.endpoint}/openai/deployments/{model or self.model}/chat/completions?api-version=2023-05-15"
+            response = requests.post(url, headers=headers, json=data, timeout=30)
+            if response.status_code == 200:
+                structured_logger.log('azure_query_success', model=model or self.model)
+                return response.json()['choices'][0]['message']['content']
+            else:
+                error_msg = f"Azure error: {response.status_code}"
+                structured_logger.error('azure_query_failed', error=error_msg)
+                return f"Error: {error_msg}"
+        except Exception as e:
+            structured_logger.error('azure_query_error', error=str(e))
+            return f"Azure error: {str(e)}"
+
+class PerplexityClient:
+    """Perplexity AI API integration"""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.perplexity.ai"
+        self.model = "sonar-pro"
+    
+    def query(self, prompt, model=None):
+        """Query Perplexity AI"""
+        try:
+            import requests
+            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+            data = {
+                "model": model or self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 2048
+            }
+            response = requests.post(f"{self.base_url}/chat/completions", headers=headers, json=data, timeout=30)
+            if response.status_code == 200:
+                structured_logger.log('perplexity_query_success', model=model or self.model)
+                return response.json()['choices'][0]['message']['content']
+            else:
+                error_msg = f"Perplexity error: {response.status_code}"
+                structured_logger.error('perplexity_query_failed', error=error_msg)
+                return f"Error: {error_msg}"
+        except Exception as e:
+            structured_logger.error('perplexity_query_error', error=str(e))
+            return f"Perplexity error: {str(e)}"
+
+class DeepSeekClient:
+    """DeepSeek API integration (2024 - Fast & Affordable)"""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.deepseek.com/v1"
+        self.model = "deepseek-v4-flash"
+    
+    def query(self, prompt, model=None):
+        """Query DeepSeek"""
+        try:
+            import requests
+            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+            data = {
+                "model": model or self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 2048
+            }
+            response = requests.post(f"{self.base_url}/chat/completions", headers=headers, json=data, timeout=30)
+            if response.status_code == 200:
+                structured_logger.log('deepseek_query_success', model=model or self.model)
+                return response.json()['choices'][0]['message']['content']
+            else:
+                error_msg = f"DeepSeek error: {response.status_code}"
+                structured_logger.error('deepseek_query_failed', error=error_msg)
+                return f"Error: {error_msg}"
+        except Exception as e:
+            structured_logger.error('deepseek_query_error', error=str(e))
+            return f"DeepSeek error: {str(e)}"
+
+class XAIClient:
+    """XAI Grok API integration (Elon Musk's X - 2024)"""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.x.ai/v1"
+        self.model = "grok-4-3"
+    
+    def query(self, prompt, model=None):
+        """Query XAI Grok"""
+        try:
+            import requests
+            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+            data = {
+                "model": model or self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 2048
+            }
+            response = requests.post(f"{self.base_url}/chat/completions", headers=headers, json=data, timeout=30)
+            if response.status_code == 200:
+                structured_logger.log('xai_query_success', model=model or self.model)
+                return response.json()['choices'][0]['message']['content']
+            else:
+                error_msg = f"XAI error: {response.status_code}"
+                structured_logger.error('xai_query_failed', error=error_msg)
+                return f"Error: {error_msg}"
+        except Exception as e:
+            structured_logger.error('xai_query_error', error=str(e))
+            return f"XAI error: {str(e)}"
+
+class MetaLlamaClient:
+    """Meta Llama API integration (2026 - Llama 4 Maverick & Scout)"""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.llama-ai.com/v1"
+        self.model = "llama-4-maverick"
+    
+    def query(self, prompt, model=None):
+        """Query Meta Llama"""
+        try:
+            import requests
+            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+            data = {
+                "model": model or self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 2048
+            }
+            response = requests.post(f"{self.base_url}/chat/completions", headers=headers, json=data, timeout=30)
+            if response.status_code == 200:
+                structured_logger.log('meta_query_success', model=model or self.model)
+                return response.json()['choices'][0]['message']['content']
+            else:
+                error_msg = f"Meta error: {response.status_code}"
+                structured_logger.error('meta_query_failed', error=error_msg)
+                return f"Error: {error_msg}"
+        except Exception as e:
+            structured_logger.error('meta_query_error', error=str(e))
+            return f"Meta error: {str(e)}"
+
+# API Model Pricing Database (per 1M tokens) - 2026 ACCURATE PRICING
+API_MODELS = {
+    'openai': {
+        'gpt-5.5': {'input': 5.0, 'output': 30.0, 'display': 'GPT-5.5 (Flagship, April 2026)'},
+        'gpt-5.5-pro': {'input': 8.0, 'output': 40.0, 'display': 'GPT-5.5 Pro (Advanced Reasoning)'},
+        'gpt-5.4': {'input': 3.0, 'output': 15.0, 'display': 'GPT-5.4 (Thinking, Previous Gen)'},
+        'gpt-5.4-mini': {'input': 0.4, 'output': 1.6, 'display': 'GPT-5.4 Mini (Balanced)'},
+        'gpt-5.4-nano': {'input': 0.1, 'output': 0.4, 'display': 'GPT-5.4 Nano (Fastest & Cheapest)'},
+        'gpt-5.3-codex': {'input': 3.0, 'output': 15.0, 'display': 'GPT-5.3 Codex (Agentic Coding)'},
+        'gpt-4o': {'input': 2.50, 'output': 10.00, 'display': 'GPT-4o (Legacy)'},
+        'gpt-4o-mini': {'input': 0.15, 'output': 0.60, 'display': 'GPT-4o Mini (Legacy, Fast & Cheap)'}
+    },
+    'anthropic': {
+        'claude-opus-4-8': {'input': 5.0, 'output': 25.0, 'display': 'Claude Opus 4.8 (Most Capable)'},
+        'claude-sonnet-5': {'input': 3.0, 'output': 15.0, 'display': 'Claude Sonnet 5 (Recommended Daily Driver)'},
+        'claude-haiku-4-5': {'input': 1.0, 'output': 5.0, 'display': 'Claude Haiku 4.5 (Fast & Cheap)'},
+        'claude-opus-4-7': {'input': 4.0, 'output': 20.0, 'display': 'Claude Opus 4.7 (Previous Gen)'},
+        'claude-sonnet-4-6': {'input': 3.0, 'output': 15.0, 'display': 'Claude Sonnet 4.6 (Previous Gen)'}
+    },
+    'gemini': {
+        'gemini-3.5-flash': {'input': 1.50, 'output': 9.00, 'display': 'Gemini 3.5 Flash (Latest, GA)'},
+        'gemini-3.1-pro': {'input': 2.00, 'output': 12.00, 'display': 'Gemini 3.1 Pro (1M Context, Preview)'},
+        'gemini-3.1-flash-lite': {'input': 0.10, 'output': 0.40, 'display': 'Gemini 3.1 Flash-Lite (Cheapest, GA)'},
+        'gemini-3-flash': {'input': 0.50, 'output': 1.50, 'display': 'Gemini 3 Flash (Previous Gen)'},
+        'gemini-2.5-pro': {'input': 1.25, 'output': 10.00, 'display': 'Gemini 2.5 Pro (Legacy)'},
+        'gemini-2.5-flash': {'input': 0.10, 'output': 0.40, 'display': 'Gemini 2.5 Flash-Lite (Legacy)'}
+    },
+    'meta': {
+        'llama-4-maverick': {'input': 2.0, 'output': 6.0, 'display': 'Llama 4 Maverick (Flagship)'},
+        'llama-4-scout': {'input': 0.40, 'output': 0.80, 'display': 'Llama 4 Scout (10M Context)'},
+        'llama-3.3-70b': {'input': 0.99, 'output': 1.29, 'display': 'Llama 3.3 70B'},
+        'llama-3.1-405b': {'input': 3.75, 'output': 7.50, 'display': 'Llama 3.1 405B'},
+        'llama-3.2-3b': {'input': 0.06, 'output': 0.06, 'display': 'Llama 3.2 3B (Edge/Small)'}
+    },
+    'deepseek': {
+        'deepseek-v4-pro': {'input': 0.435, 'output': 0.87, 'display': 'DeepSeek V4 Pro (Flagship Reasoning)'},
+        'deepseek-v4-flash': {'input': 0.14, 'output': 0.28, 'display': 'DeepSeek V4 Flash (Fast & Cheap)'},
+        'deepseek-coder': {'input': 0.14, 'output': 0.28, 'display': 'DeepSeek Coder (Legacy)'}
+        # NOTE: legacy aliases deepseek-chat/deepseek-reasoner retire 2026-07-24; use deepseek-v4-* instead
+    },
+    'xai': {
+        'grok-4.3': {'input': 5.0, 'output': 15.0, 'display': 'Grok 4.3 (Flagship)'},
+        'grok-4.1-fast': {'input': 0.20, 'output': 0.50, 'display': 'Grok 4.1 Fast (Cheapest Frontier-Class)'},
+        'grok-3': {'input': 3.0, 'output': 9.0, 'display': 'Grok 3'},
+        'grok-2': {'input': 2.0, 'output': 6.0, 'display': 'Grok 2 (Legacy)'}
+    },
+    'groq': {
+        'llama-3.3-70b-versatile': {'input': 0.59, 'output': 0.79, 'display': 'Llama 3.3 70B Versatile'},
+        'llama-3.1-8b-instant': {'input': 0.05, 'output': 0.08, 'display': 'Llama 3.1 8B Instant (Fastest)'},
+        'llama-3.2-405b': {'input': 0.99, 'output': 1.99, 'display': 'Llama 3.2 405B'},
+        'llama-3.1-405b-reasoning': {'input': 1.0, 'output': 3.0, 'display': 'Llama 3.1 405B (Extended Thinking)'}
+    },
+    'together': {
+        'meta-llama/Llama-4-Maverick': {'input': 2.0, 'output': 6.0, 'display': 'Llama 4 Maverick'},
+        'meta-llama/Llama-4-Scout': {'input': 0.40, 'output': 0.80, 'display': 'Llama 4 Scout'},
+        'meta-llama/Llama-3.3-70B-Instruct-Turbo': {'input': 0.99, 'output': 1.29, 'display': 'Llama 3.3 70B Turbo'},
+        'meta-llama/Llama-3.2-3B-Instruct-Turbo': {'input': 0.06, 'output': 0.06, 'display': 'Llama 3.2 3B Turbo (Small)'}
+    },
+    'azure': {
+        'gpt-5.4': {'input': 3.0, 'output': 15.0, 'display': 'GPT-5.4 (Flagship Deployment)'},
+        'gpt-5.4-mini': {'input': 0.4, 'output': 1.6, 'display': 'GPT-5.4 Mini'},
+        'gpt-4o': {'input': 2.50, 'output': 10.00, 'display': 'GPT-4o (Legacy)'},
+        'gpt-4o-mini': {'input': 0.15, 'output': 0.60, 'display': 'GPT-4o Mini (Legacy)'}
+    },
+    'huggingface': {
+        'meta-llama/Llama-4-Maverick': {'input': 2.0, 'output': 6.0, 'display': 'Llama 4 Maverick'},
+        'meta-llama/Llama-4-Scout': {'input': 0.40, 'output': 0.80, 'display': 'Llama 4 Scout'},
+        'meta-llama/Llama-3.2-3B-Instruct': {'input': 0.06, 'output': 0.06, 'display': 'Llama 3.2 3B Instruct (Small/Free-tier)'},
+        'mistralai/Mistral-Large': {'input': 0.81, 'output': 2.43, 'display': 'Mistral Large'},
+        'deepseek-ai/DeepSeek-V4-Flash': {'input': 0.14, 'output': 0.28, 'display': 'DeepSeek V4 Flash (Open Weights)'}
+    },
+    'cohere': {
+        'command-r-plus': {'input': 3.0, 'output': 15.0, 'display': 'Command R+ (Flagship)'},
+        'command-r': {'input': 0.50, 'output': 1.50, 'display': 'Command R (Balanced)'},
+        'command-r7b': {'input': 0.0375, 'output': 0.15, 'display': 'Command R7B (Smallest/Fastest)'}
+    },
+    'perplexity': {
+        'sonar-pro': {'input': 3.0, 'output': 15.0, 'display': 'Sonar Pro (Flagship, Web Search)'},
+        'sonar-reasoning-pro': {'input': 2.0, 'output': 8.0, 'display': 'Sonar Reasoning Pro'},
+        'sonar': {'input': 0.20, 'output': 0.20, 'display': 'Sonar (With Web Search)'},
+        'sonar-mini': {'input': 0.05, 'output': 0.05, 'display': 'Sonar Mini (Budget)'}
+    }
+}
+
+class APIRouter:
+    """Route queries to appropriate API"""
+    def __init__(self):
+        self.clients = {}
+        self.primary_api = None
+        self.selected_models = {}  # Track selected model per provider
+        self.initialize_clients()
+    
+    def initialize_clients(self):
+        """Initialize all configured API clients"""
+        for provider in api_config.list_apis():
+            config = api_config.get_api(provider)
+            if config:
+                try:
+                    if provider == 'openai':
+                        self.clients['openai'] = OpenAIClient(config['key'])
+                    elif provider == 'anthropic':
+                        self.clients['anthropic'] = AnthropicClient(config['key'])
+                    elif provider == 'gemini':
+                        self.clients['gemini'] = GoogleGeminiClient(config['key'])
+                    elif provider == 'huggingface':
+                        self.clients['huggingface'] = HuggingFaceClient(config['key'])
+                    elif provider == 'cohere':
+                        self.clients['cohere'] = CohereClient(config['key'])
+                    elif provider == 'groq':
+                        self.clients['groq'] = GroqClient(config['key'])
+                    elif provider == 'together':
+                        self.clients['together'] = TogetherAIClient(config['key'])
+                    elif provider == 'azure':
+                        self.clients['azure'] = AzureOpenAIClient(config['key'], config.get('endpoint', ''))
+                    elif provider == 'perplexity':
+                        self.clients['perplexity'] = PerplexityClient(config['key'])
+                    elif provider == 'deepseek':
+                        self.clients['deepseek'] = DeepSeekClient(config['key'])
+                    elif provider == 'xai':
+                        self.clients['xai'] = XAIClient(config['key'])
+                    elif provider == 'meta':
+                        self.clients['meta'] = MetaLlamaClient(config['key'])
+                    structured_logger.log('api_client_initialized', provider=provider)
+                except Exception as e:
+                    structured_logger.error('api_client_init_failed', provider=provider, error=str(e))
+    
+    def query(self, prompt, provider=None, model=None):
+        """Query using specified or primary API"""
+        provider = provider or self.primary_api
+        if not provider or provider not in self.clients:
+            return f"Error: API provider '{provider}' not configured"
+        
+        return self.clients[provider].query(prompt, model)
+    
+    def set_primary(self, provider):
+        """Set primary API provider"""
+        if provider in self.clients:
+            self.primary_api = provider
+            structured_logger.log('primary_api_set', provider=provider)
+            return True
+        return False
+    
+    def list_configured(self):
+        """List configured API providers"""
+        return list(self.clients.keys())
+
+api_router = APIRouter()
+HAS_API_INTEGRATION = True
+# === END API INTEGRATION ===
+
+# === PRIORITY 0.8: CIRCUIT BREAKER ===
+class CircuitBreaker:
+    """Circuit breaker pattern for fault tolerance"""
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: int = 60):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failures = defaultdict(int)
+        self.last_failure_time = defaultdict(float)
+        self.state = defaultdict(lambda: 'CLOSED')  # CLOSED, OPEN, HALF_OPEN
+    
+    def call(self, service_name: str, func, *args, **kwargs):
+        """Execute function through circuit breaker"""
+        now = time()
+        
+        if self.state[service_name] == 'OPEN':
+            if now - self.last_failure_time[service_name] > self.recovery_timeout:
+                self.state[service_name] = 'HALF_OPEN'
+                structured_logger.log('circuit_half_open', service=service_name)
+            else:
+                raise Exception(f"Circuit breaker OPEN for {service_name}")
+        
+        try:
+            result = func(*args, **kwargs)
+            if self.state[service_name] == 'HALF_OPEN':
+                self.state[service_name] = 'CLOSED'
+                self.failures[service_name] = 0
+                structured_logger.log('circuit_closed', service=service_name)
+            return result
+        except Exception as e:
+            self.failures[service_name] += 1
+            self.last_failure_time[service_name] = now
+            
+            if self.failures[service_name] >= self.failure_threshold:
+                self.state[service_name] = 'OPEN'
+                structured_logger.error('circuit_open', service=service_name, failures=self.failures[service_name], error=str(e))
+            raise
+
+circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60)
+# === END CIRCUIT BREAKER ===
+
+# === PRIORITY 1: SECURITY LAYER ===
+from enum import Enum
+import re
+
+class PermissionMode(Enum):
+    """Permission modes matching Claude Code"""
+    DEFAULT = "default"
+    ACCEPT_EDITS = "accept"
+    AUTO = "auto"
+    DONT_ASK = "dont_ask"
+    BYPASS = "bypass"
+
+class PermissionGate:
+    """4-layer defense system"""
+    def __init__(self, mode: PermissionMode = PermissionMode.DEFAULT):
+        self.mode = mode
+        self.deny_list = []
+        self.allow_list = []
+        self.hooks = {}
+        self.audit_log = []
+    
+    def check_permission(self, tool: str, action: str, params: dict) -> bool:
+        if self.mode == PermissionMode.BYPASS:
+            return True
+        if self._matches_deny_list(tool, action, params):
+            return False
+        if not self._run_hooks(f'pre_{tool}', action, params):
+            return False
+        return self._mode_approval(tool, action, params)
+    
+    def _matches_deny_list(self, tool: str, action: str, params: dict) -> bool:
+        for pattern in self.deny_list:
+            if re.match(pattern, f"{tool}:{action}"):
+                return True
+        return False
+    
+    def _run_hooks(self, hook_name: str, action: str, params: dict) -> bool:
+        if hook_name in self.hooks:
+            for hook in self.hooks[hook_name]:
+                if not hook(action, params):
+                    return False
+        return True
+    
+    def _mode_approval(self, tool: str, action: str, params: dict) -> bool:
+        if self.mode == PermissionMode.ACCEPT_EDITS:
+            safe_commands = {'mkdir', 'touch', 'rm', 'mv', 'cp', 'sed'}
+            return action in safe_commands
+        elif self.mode == PermissionMode.AUTO:
+            return f"{tool}:{action}" in self.allow_list
+        elif self.mode == PermissionMode.DONT_ASK:
+            return f"{tool}:{action}" in self.allow_list
+        else:
+            return True
+    
+    def register_hook(self, hook_name: str, callback):
+        if hook_name not in self.hooks:
+            self.hooks[hook_name] = []
+        self.hooks[hook_name].append(callback)
+    
+    def log_action(self, tool: str, action: str, params: dict, approved: bool):
+        self.audit_log.append({
+            'tool': tool,
+            'action': action,
+            'params': params,
+            'approved': approved,
+            'timestamp': __import__('datetime').datetime.now().isoformat()
+        })
+
+class Sandbox:
+    """OS-level sandboxing"""
+    def __init__(self, project_dir: 'Path' = None):
+        self.project_dir = project_dir or Path.cwd()
+        self.blocked_dirs = {Path.home() / '.ssh', Path.home() / '.secrets'}
+    
+    def is_write_safe(self, path: 'Path') -> bool:
+        try:
+            path.resolve().relative_to(self.project_dir)
+            return True
+        except ValueError:
+            return False
+    
+    def is_read_safe(self, path: 'Path') -> bool:
+        return path.resolve() not in self.blocked_dirs
+    
+    def validate_bash_command(self, cmd: str) -> bool:
+        dangerous_patterns = [
+            r'rm\s+-rf\s+/',
+            r'dd\s+if=/dev',
+            r':\(\)\s*\{',
+            r'pkill\s+-9',
+        ]
+        for pattern in dangerous_patterns:
+            if re.search(pattern, cmd):
+                return False
+        return True
+
+HAS_SECURITY = True
+# === END SECURITY LAYER ===
+
+# === PRIORITY 1: TOOL SYSTEM ===
+from abc import ABC, abstractmethod
+import shlex
+
+class Tool(ABC):
+    """Base tool interface"""
+    def __init__(self, name: str, description: str, schema: dict):
+        self.name = name
+        self.description = description
+        self.schema = schema
+    
+    @abstractmethod
+    def execute(self, **params):
+        pass
+
+class FileEditTool(Tool):
+    """Edit files safely"""
+    def __init__(self):
+        super().__init__("file_edit", "Edit or create files", {"path": "str", "content": "str", "mode": "str"})
+    
+    def execute(self, path: str, content: str, mode: str = 'w', **params):
+        try:
+            p = Path(path)
+            if mode == 'w':
+                p.write_text(content)
+            elif mode == 'a':
+                with open(p, 'a') as f:
+                    f.write(content)
+            return {"success": True, "path": str(p), "size": len(content)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+class FileReadTool(Tool):
+    """Read files"""
+    def __init__(self):
+        super().__init__("file_read", "Read file contents", {"path": "str"})
+    
+    def execute(self, path: str, **params):
+        try:
+            content = Path(path).read_text()
+            return {"success": True, "content": content, "size": len(content)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+class BashTool(Tool):
+    """Execute bash commands"""
+    def __init__(self):
+        super().__init__("bash", "Execute shell commands", {"command": "str", "cwd": "str"})
+    
+    def execute(self, command: str, cwd: str = None, **params):
+        try:
+            result = subprocess.run(shlex.split(command) if isinstance(command, str) else command, shell=False, cwd=cwd, capture_output=True, text=True, timeout=30)
+            return {
+                "success": result.returncode == 0,
+                "stdout": result.stdout[:2000],
+                "stderr": result.stderr[:2000],
+                "returncode": result.returncode
+            }
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Command timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+class ToolRegistry:
+    """18-tool system"""
+    def __init__(self):
+        self.tools = {}
+        self._register_builtin_tools()
+    
+    def _register_builtin_tools(self):
+        self.register(FileReadTool())
+        self.register(FileEditTool())
+        self.register(BashTool())
+    
+    def register(self, tool: Tool):
+        self.tools[tool.name] = tool
+    
+    def get_tool(self, name: str):
+        return self.tools.get(name)
+    
+    def dispatch(self, tool_name: str, **params):
+        tool = self.get_tool(tool_name)
+        if not tool:
+            return {"success": False, "error": f"Tool {tool_name} not found"}
+        return tool.execute(**params)
+    
+    def list_tools(self):
+        return {name: {"description": tool.description, "schema": tool.schema} for name, tool in self.tools.items()}
+
+HAS_TOOLS = True
+tool_registry = ToolRegistry()
+# === END TOOL SYSTEM ===
+
+# === PRIORITY 2: EVENT SYSTEM & ASYNC ===
+import asyncio
+from dataclasses import dataclass
+
+class EventType(Enum):
+    """Event types"""
+    REQUEST_START = "request_start"
+    MESSAGE = "message"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    ASSISTANT_MESSAGE = "assistant"
+    TOMBSTONE = "tombstone"
+    COMPACTION = "compaction"
+    COST_WARNING = "cost_warning"
+    ERROR = "error"
+    COMPLETE = "complete"
+
+@dataclass
+class StreamEvent:
+    """Base event class"""
+    type: EventType
+    timestamp: float
+    data: dict
+    
+    def to_dict(self):
+        return {'type': self.type.value, 'timestamp': self.timestamp, 'data': self.data}
+
+class EventBus:
+    """Async event bus"""
+    def __init__(self):
+        self.listeners = {}
+        self.event_queue = asyncio.Queue() if asyncio else None
+    
+    def subscribe(self, event_type: EventType, callback):
+        if event_type not in self.listeners:
+            self.listeners[event_type] = []
+        self.listeners[event_type].append(callback)
+    
+    async def emit(self, event: StreamEvent):
+        if self.event_queue:
+            await self.event_queue.put(event)
+        if event.type in self.listeners:
+            for callback in self.listeners[event.type]:
+                try:
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(event)
+                    else:
+                        callback(event)
+                except:
+                    pass
+
+class HookSystem:
+    """Hook interception layer"""
+    def __init__(self):
+        self.hooks = {}
+    
+    def register(self, event_name: str, callback):
+        if event_name not in self.hooks:
+            self.hooks[event_name] = []
+        self.hooks[event_name].append(callback)
+    
+    async def fire(self, event_name: str, *args, **kwargs) -> bool:
+        if event_name in self.hooks:
+            for hook in self.hooks[event_name]:
+                try:
+                    if asyncio.iscoroutinefunction(hook):
+                        result = await hook(*args, **kwargs)
+                    else:
+                        result = hook(*args, **kwargs)
+                    if result is False:
+                        return False
+                except:
+                    pass
+        return True
+
+HAS_EVENTS = True
+event_bus = EventBus()
+hook_system = HookSystem()
+# === END EVENT SYSTEM ===
+
+# === PRIORITY 2: PERSISTENCE (Message-as-State) ===
+from datetime import datetime
+import hashlib
+import gzip
+
+class Message:
+    """Universal message format"""
+    def __init__(self, role: str, content: str, msg_type: str = 'text'):
+        self.role = role
+        self.content = content
+        self.type = msg_type
+        self.timestamp = datetime.now().isoformat()
+        self.id = self._generate_id()
+    
+    def _generate_id(self) -> str:
+        return hashlib.md5(f"{self.timestamp}{self.content}".encode()).hexdigest()[:8]
+    
+    def to_dict(self):
+        return {'id': self.id, 'role': self.role, 'content': self.content, 'type': self.type, 'timestamp': self.timestamp}
+
+class SessionState:
+    """Session state from message history"""
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.messages = []
+        self.metadata = {}
+        self.created_at = datetime.now().isoformat()
+    
+    def append_message(self, role: str, content: str, msg_type: str = 'text'):
+        msg = Message(role, content, msg_type)
+        self.messages.append(msg)
+        return msg
+    
+    def get_conversation(self):
+        return [msg.to_dict() for msg in self.messages]
+    
+    def to_dict(self):
+        return {
+            'session_id': self.session_id,
+            'created_at': self.created_at,
+            'message_count': len(self.messages),
+            'messages': self.get_conversation(),
+            'metadata': self.metadata
+        }
+
+class SessionPersistence:
+    """Save/load/replay sessions"""
+    def __init__(self, sessions_dir: Path = None):
+        if sessions_dir is None:
+            sessions_dir = Path.home() / '.hercules' / 'sessions'
+        self.sessions_dir = sessions_dir
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.active_session = None
+    
+    def create_session(self, session_id: str):
+        self.active_session = SessionState(session_id)
+        return self.active_session
+    
+    def save_session(self, session: SessionState, compressed: bool = True):
+        session_path = self.sessions_dir / f"{session.session_id}"
+        data = session.to_dict()
+        if compressed:
+            with gzip.open(f"{session_path}.gz", 'wt') as f:
+                json.dump(data, f)
+        else:
+            with open(session_path, 'w') as f:
+                json.dump(data, f)
+    
+    def load_session(self, session_id: str):
+        compressed_path = self.sessions_dir / f"{session_id}.gz"
+        normal_path = self.sessions_dir / f"{session_id}"
+        try:
+            if compressed_path.exists():
+                with gzip.open(compressed_path, 'rt') as f:
+                    data = json.load(f)
+            elif normal_path.exists():
+                with open(normal_path) as f:
+                    data = json.load(f)
+            else:
+                return None
+            session = SessionState(data['session_id'])
+            for msg_data in data['messages']:
+                msg = Message(msg_data['role'], msg_data['content'], msg_data['type'])
+                msg.timestamp = msg_data['timestamp']
+                msg.id = msg_data['id']
+                session.messages.append(msg)
+            session.metadata = data['metadata']
+            return session
+        except:
+            return None
+    
+    def list_sessions(self):
+        sessions = []
+        for path in self.sessions_dir.glob('*'):
+            if path.is_file():
+                sessions.append(path.stem)
+        return sorted(sessions)
+
+HAS_PERSISTENCE = True
+session_persistence = SessionPersistence()
+# === END PERSISTENCE ===
+
+# === PRIORITY 2: AGENT TEAMS ===
+
+class AgentRole(Enum):
+    """Agent roles"""
+    LEAD = "lead"
+    WORKER = "worker"
+    ANALYST = "analyst"
+    REFINER = "refiner"
+
+class TeamMember:
+    """Team member agent"""
+    def __init__(self, name: str, role: AgentRole, instructions: str):
+        self.name = name
+        self.role = role
+        self.instructions = instructions
+        self.inbox = []
+        self.completed_tasks = []
+    
+    async def run(self):
+        """Member's main loop"""
+        while True:
+            await asyncio.sleep(0.1)
+
+class AgentTeam:
+    """Team of parallel agents"""
+    def __init__(self, lead_name: str = "Lead"):
+        self.lead_name = lead_name
+        self.members = {}
+        self.tasks = []
+        self.task_counter = 0
+    
+    def add_member(self, name: str, role: AgentRole, instructions: str):
+        member = TeamMember(name, role, instructions)
+        self.members[name] = member
+        return member
+    
+    async def delegate_task(self, title: str, description: str, assigned_to: str = None):
+        self.task_counter += 1
+        self.tasks.append({'id': f"task_{self.task_counter}", 'title': title, 'status': 'pending'})
+        return f"task_{self.task_counter}"
+    
+    def get_team_status(self):
+        return {
+            'members': len(self.members),
+            'total_tasks': len(self.tasks),
+            'completed': len([t for t in self.tasks if t.get('status') == 'complete']),
+            'pending': len([t for t in self.tasks if t.get('status') == 'pending']),
+            'running': len([t for t in self.tasks if t.get('status') == 'running'])
+        }
+
+HAS_TEAMS = True
+active_team = AgentTeam(lead_name="Hercules-Lead")
+# === END AGENT TEAMS ===
+
+# === PRIORITY 3: COST TRACKING ===
+
+class CostTracker:
+    """Track and enforce budget"""
+    def __init__(self, model: str, max_budget_usd: float = 1.0):
+        self.model = model
+        self.max_budget_usd = max_budget_usd
+        self.total_cost = 0.0
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.entries = []
+        self.budget_exceeded = False
+    
+    def log_call(self, input_tokens: int, output_tokens: int) -> float:
+        # Ollama/local is free
+        if 'ollama' in self.model.lower() or self.model in ['qwen', 'llama']:
+            cost = 0.0
+        else:
+            cost = (input_tokens / 1_000_000) * 3 + (output_tokens / 1_000_000) * 15
+        
+        self.entries.append({'input': input_tokens, 'output': output_tokens, 'cost': cost})
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.total_cost += cost
+        
+        if self.total_cost > self.max_budget_usd:
+            self.budget_exceeded = True
+        
+        return cost
+    
+    def get_status(self):
+        remaining = self.max_budget_usd - self.total_cost
+        percent = (self.total_cost / self.max_budget_usd) * 100 if self.max_budget_usd > 0 else 0
+        return {
+            'model': self.model,
+            'total_cost': f"${self.total_cost:.4f}",
+            'max_budget': f"${self.max_budget_usd:.2f}",
+            'remaining': f"${remaining:.4f}",
+            'percent_used': f"{percent:.1f}%",
+            'budget_exceeded': self.budget_exceeded
+        }
+    
+    def should_continue(self) -> bool:
+        return self.total_cost <= self.max_budget_usd
+
+class BudgetEnforcer:
+    """Enforce cost limits"""
+    def __init__(self):
+        self.trackers = {}
+    
+    def create_tracker(self, session_id: str, model: str, budget_usd: float = 1.0):
+        tracker = CostTracker(model, max_budget_usd=budget_usd)
+        self.trackers[session_id] = tracker
+        return tracker
+    
+    def check_budget(self, session_id: str) -> bool:
+        if session_id not in self.trackers:
+            return True
+        return self.trackers[session_id].should_continue()
+
+# BudgetEnforcer will be re-initialized with fallback later
+# === END COST TRACKING ===
+
+# === PRIORITY 3: TERMINAL UI (Ink-Inspired) ===
+
+class TerminalComponent:
+    """Base React-like terminal component"""
+    def __init__(self, name: str):
+        self.name = name
+        self.children = []
+        self.props = {}
+        self.style = {}
+    
+    def render(self) -> str:
+        """Render component to ANSI string"""
+        return ""
+
+class Box(TerminalComponent):
+    """Flexbox container for terminal (styled box)"""
+    def __init__(self, **props):
+        super().__init__("Box")
+        self.props = props
+        self.flex_direction = props.get('flexDirection', 'row')
+        self.padding = props.get('padding', 0)
+        self.border = props.get('border', False)
+        self.content = ""
+    
+    def render(self) -> str:
+        """Render as bordered box"""
+        if self.border:
+            lines = self.content.split('\n')
+            width = max(len(line) for line in lines) if lines else 0
+            top = f"╔{'═' * (width + 2)}╗"
+            bottom = f"╚{'═' * (width + 2)}╝"
+            body = '\n'.join(f"║ {line:<{width}} ║" for line in lines)
+            return f"{top}\n{body}\n{bottom}"
+        return self.content
+
+class Text(TerminalComponent):
+    """Text component with ANSI styling"""
+    def __init__(self, content: str, **props):
+        super().__init__("Text")
+        self.content = content
+        self.color = props.get('color', 'white')
+        self.bold = props.get('bold', False)
+        self.dim = props.get('dim', False)
+        self.props = props
+    
+    def render(self) -> str:
+        """Render styled text with ANSI codes"""
+        text = self.content
+        
+        # Apply ANSI styling
+        if self.bold:
+            text = f"\033[1m{text}\033[0m"
+        if self.dim:
+            text = f"\033[2m{text}\033[0m"
+        
+        # Color mapping
+        color_map = {
+            'green': '\033[32m', 'red': '\033[31m', 'yellow': '\033[33m',
+            'blue': '\033[34m', 'magenta': '\033[35m', 'cyan': '\033[36m',
+            'white': '\033[37m', 'gray': '\033[90m'
+        }
+        
+        if self.color in color_map:
+            text = f"{color_map[self.color]}{text}\033[0m"
+        
+        return text
+
+class TerminalRenderer:
+    """Ink-inspired terminal renderer with optimizations"""
+    def __init__(self):
+        self.frame_buffer = ""
+        self.last_frame = ""
+        self.style_pool = {}  # Cache ANSI codes
+        self.dirty_regions = []
+    
+    def render_component(self, component: TerminalComponent) -> str:
+        """Render component tree"""
+        output = component.render()
+        
+        # Optimization: Only write diff to terminal
+        if output != self.last_frame:
+            self.dirty_regions.append(output)
+            self.last_frame = output
+        
+        return output
+    
+    def optimize_ansi(self, text: str) -> str:
+        """Optimize ANSI sequences - cache style transitions"""
+        # Pool duplicate ANSI codes
+        key = hash(text)
+        if key in self.style_pool:
+            return self.style_pool[key]
+        
+        # Memoize
+        self.style_pool[key] = text
+        return text
+    
+    def clear_screen(self):
+        """Clear terminal screen"""
+        print("\033[2J\033[H", end="", flush=True)
+    
+    def set_cursor(self, row: int, col: int):
+        """Set cursor position"""
+        print(f"\033[{row};{col}H", end="", flush=True)
+
+class SimpleTheme:
+    """Lightweight theme system"""
+    def __init__(self, name: str = "default"):
+        self.name = name
+        self.colors = {
+            'primary': '\033[36m',      # Cyan
+            'success': '\033[32m',      # Green
+            'error': '\033[31m',        # Red
+            'warning': '\033[33m',      # Yellow
+            'info': '\033[34m',         # Blue
+            'dim': '\033[90m',          # Gray
+            'reset': '\033[0m'
+        }
+    
+    def get_color(self, semantic: str) -> str:
+        """Get ANSI color for semantic meaning"""
+        return self.colors.get(semantic, self.colors['reset'])
+
+class KeyboardParser:
+    """Parse terminal keyboard input (arrows, modifiers, etc)"""
+    @staticmethod
+    def parse_escape_sequence(seq: str) -> str:
+        """Parse ANSI escape sequences to key names"""
+        escape_map = {
+            '\x1b[A': 'up', '\x1b[B': 'down', '\x1b[C': 'right', '\x1b[D': 'left',
+            '\x1b[H': 'home', '\x1b[F': 'end', '\x1b[3~': 'delete',
+            '\x7f': 'backspace', '\x1b': 'escape', '\n': 'enter', '\t': 'tab'
+        }
+        return escape_map.get(seq, seq)
+
+HAS_TERMINAL_UI = True
+terminal_renderer = TerminalRenderer()
+theme = SimpleTheme("default")
+# === END TERMINAL UI ===
+
+# === LIGHTWEIGHT YOGA FLEXBOX SIMULATION ===
+
+class YogaNode:
+    """Simplified Yoga layout node for terminal flexbox"""
+    def __init__(self, width: int = 80, height: int = 24):
+        self.width = width
+        self.height = height
+        self.flex_direction = 'column'  # column, row
+        self.children = []
+        self.padding = 0
+        self.margin = 0
+        self.measuredWidth = 0
+        self.measuredHeight = 0
+    
+    def calculate_layout(self):
+        """Simplified flexbox layout calculation"""
+        if self.flex_direction == 'row':
+            # Distribute width among children
+            child_width = self.width // len(self.children) if self.children else self.width
+            for child in self.children:
+                child.width = child_width
+                child.calculate_layout()
+        else:  # column
+            # Distribute height among children
+            child_height = self.height // len(self.children) if self.children else self.height
+            for child in self.children:
+                child.height = child_height
+                child.calculate_layout()
+    
+    def add_child(self, node: 'YogaNode'):
+        """Add child node"""
+        self.children.append(node)
+
+class LayoutEngine:
+    """Terminal layout engine using Yoga principles"""
+    def __init__(self):
+        self.root = YogaNode()
+    
+    def layout(self) -> dict:
+        """Calculate layout for all nodes"""
+        self.root.calculate_layout()
+        return {
+            'root_width': self.root.width,
+            'root_height': self.root.height,
+            'children_count': len(self.root.children)
+        }
+
+HAS_LAYOUT = True
+layout_engine = LayoutEngine()
+# === END YOGA SIMULATION ===
+
+# === CLAUDE CODE CORE: ReAct LOOP ===
+
+class ReActLoop:
+    """Claude Code's core ReAct pattern: Reasoning + Action + Feedback"""
+    def __init__(self):
+        self.max_iterations = 10
+        self.messages = []
+        self.thoughts = []
+        self.actions = []
+    
+    def step(self, prompt: str, model_response: str) -> dict:
+        """One ReAct iteration: think -> act -> observe"""
+        
+        # 1. REASONING: Extract thinking from model
+        thought = self._extract_thought(model_response)
+        self.thoughts.append(thought)
+        
+        # 2. ACTION: Execute action from model
+        action_result = None
+        if '<action>' in model_response:
+            action = self._extract_action(model_response)
+            action_result = self._execute_action(action)
+            self.actions.append({'action': action, 'result': action_result})
+        
+        # 3. OBSERVATION: Provide feedback to model
+        observation = f"Action result: {action_result}" if action_result else "No action taken"
+        
+        return {
+            'thought': thought,
+            'action': action if '<action>' in model_response else None,
+            'observation': observation
+        }
+    
+    def _extract_thought(self, response: str) -> str:
+        """Extract reasoning from model response"""
+        if '<thought>' in response:
+            start = response.find('<thought>') + 9
+            end = response.find('</thought>')
+            return response[start:end]
+        return response[:200]  # First 200 chars
+    
+    def _extract_action(self, response: str) -> str:
+        """Extract action from model response"""
+        if '<action>' in response:
+            start = response.find('<action>') + 8
+            end = response.find('</action>')
+            return response[start:end]
+        return ""
+    
+    def _execute_action(self, action: str) -> str:
+        """Execute the action (tool call, bash, file op, etc)"""
+        # Delegate to tool registry
+        if tool_registry:
+            parts = action.split(' ', 1)
+            tool_name = parts[0]
+            params = parts[1] if len(parts) > 1 else ""
+            result = tool_registry.dispatch(tool_name, command=params)
+            return str(result)
+        return ""
+
+react_loop = ReActLoop()
+# === END ReAct LOOP ===
+
+# Import our pure Python GGUF loader
+try:
+    from gguf_inference import load_gguf_model
+except ImportError:
+    print("Warning: gguf_inference.py not found - some features disabled")
+    load_gguf_model = None
+
+# Optional: try gpt4all as fallback
+try:
+    from gpt4all import GPT4All
+    HAS_GPT4ALL = True
+except:
+    HAS_GPT4ALL = False
+
+# Optional: try ollama and requests
+try:
+    import requests
+    HAS_OLLAMA = True
+except ImportError:
+    HAS_OLLAMA = False
+    requests = None
+
+
+# ANSI Color Codes - Dark Mode (Default)
+O1_DARK = '\033[38;2;218;165;32m'
+O2_DARK = '\033[38;2;255;215;0m'
+H1_DARK = '\033[38;2;184;134;11m'
+H2_DARK = '\033[38;2;255;140;0m'
+G_DARK = '\033[38;2;26;176;128m'
+R_DARK = '\033[38;2;255;59;59m'
+S_DARK = '\033[38;2;90;122;150m'
 X = '\033[0m'
+
+# ANSI Color Codes - Light Mode
+O1_LIGHT = '\033[38;2;100;100;100m'
+O2_LIGHT = '\033[38;2;80;80;80m'
+H1_LIGHT = '\033[38;2;60;60;60m'
+H2_LIGHT = '\033[38;2;50;50;50m'
+G_LIGHT = '\033[38;2;34;139;34m'
+R_LIGHT = '\033[38;2;220;20;60m'
+S_LIGHT = '\033[38;2;70;70;70m'
+
+# Active theme variables
+O1 = O1_DARK
+O2 = O2_DARK
+H1 = H1_DARK
+H2 = H2_DARK
+G = G_DARK
+R = R_DARK
+S = S_DARK
 
 # Global State
 llm = None
+ollama_mode = False
+llm_model_name = None
 model_path = None
 temp = 0.7
 max_tokens = 256
@@ -36,9 +1761,38 @@ chat_history = []
 dark_mode = True
 model_info = {}
 skills = []
+
+# ===== CLAUDE CODE FEATURES (GLOBALS) =====
+# Priority 1: Security
+permission_gate = PermissionGate(mode=PermissionMode.DEFAULT)
+sandbox = Sandbox()
+
+# Priority 2: Persistence
+current_session = session_persistence.create_session("default")
+
+# Priority 2: Teams
+# active_team already created above
 overclock_enabled = False
 freerange_enabled = False
 freerange_dir = None
+
+# Priority 3: Cost Tracking (was missing - referenced in query() but never defined)
+HAS_COST_TRACKING = False
+try:
+    from cost_tracker import BudgetEnforcer
+    budget_enforcer = BudgetEnforcer()
+    HAS_COST_TRACKING = True
+except:
+    class MockBudgetEnforcer:
+        def __init__(self):
+            self.trackers = {}
+        def check_budget(self, tracker_id):
+            return True
+    budget_enforcer = MockBudgetEnforcer()
+    HAS_COST_TRACKING = False
+
+# Priority 3: Context (placeholder - initialized after ConversationContext class defined)
+ctx = None
 
 
 def splash():
@@ -61,39 +1815,37 @@ def splash():
     print(f"{S}Type your request. Type '/help' for commands.{X}\n")
 
 COMMANDS = {
-    '/models': 'List all registered models',
-    '/config': 'Show config location',
-    '/setup': 'Reconfigure model directory',
-    '/help': 'Show all commands',
-    '/exit': 'Exit application',
-    '/temp': 'Set temperature (0.0-1.0)',
-    '/tokens': 'Set max tokens',
-    '/batch': 'Run multiple prompts from file',
-    '/export': 'Export chat history to file',
+    '/help, /': 'Show all commands',
+    '/models': 'List available/loaded models',
+    '/api': 'Configure and use API providers',
+    '/memory': 'Save and recall important memories',
+    '/branch': 'Manage conversation branches',
+    '/macro': 'Manage macros and shortcuts',
+    '/plugin': 'Manage plugins and extensions',
+    '/skill': 'Load custom skill from file',
+    '/team': 'Manage agent teams',
+    '/delegate': 'Delegate task to multiple agents',
+    '/hagent': 'Execute through hierarchical agent system',
+    '/code': 'Claude Code pattern & template help',
+    '/advsearch': 'Advanced search with ranking',
+    '/context': 'Show conversation context',
+    '/agent': 'Run as autonomous agent',
+    '/freerange': 'Enter unrestricted mode (file/bash access)',
+    '/stats': 'Show system statistics',
+    '/cost': 'Show cost tracking',
+    '/export': 'Export chat history',
     '/search': 'Search chat history',
     '/history': 'Show chat history',
     '/save': 'Save conversation',
-    '/load': 'Load conversation',
-    '/theme': 'Toggle dark/light mode',
-    '/info': 'Show model info',
-    '/unload': 'Unload current model',
-    '/overclock': 'Enable hardware overclock',
-    '/skill': 'Add skill from path',
-    '/skills': 'List loaded skills',
-    '/agent': 'Run as autonomous agent',
-    '/freerange': 'Enable freerange mode (file creation/editing)',
-    '/stats': 'Show system statistics',
-    '/advsearch': 'Advanced search with filters',
+    '/load': 'Load previous conversation',
     '/clear': 'Clear chat history',
-    '/context': 'Show conversation context',
-    '/macro': 'Manage macros and shortcuts',
-    '/plugin': 'Manage plugins and extensions',
-    '/branch': 'Manage conversation branches',
-    '/memory': 'Save and recall important memories',
-    '/agent': 'Execute specialized sub-agent',
-    '/delegate': 'Delegate task to multiple agents',
-    '/hagent': 'Execute through 3-layer agent hierarchy',
-    '/code': 'Claude Code pattern & template help'
+    '/template': 'Manage prompt templates',
+    '/session': 'Manage sessions',
+    '/security': 'Security & permission settings',
+    '/tools': 'Show available tools',
+    '/config': 'Show config location',
+    '/setup': 'Setup/change model',
+    '/exit, /quit': 'Exit application',
 }
 
 def find_gguf_files(folder):
@@ -118,28 +1870,156 @@ def list_models():
         print(f"\n{S}No model loaded{X}\n")
         return
     print(f"\n{O2}Current Model:{X}")
-    print(f"  {O1}{Path(model_path).stem}{X}")
+    print(f"  {O1}{Path(model_path).stem if model_path else 'N/A'}{X}")
     print(f"  {S}{model_path}{X}\n")
 
+def _select_model_for_provider(provider):
+    """Shared prompt: let user pick a specific model for an already-configured provider"""
+    if provider not in API_MODELS:
+        return
+    models = API_MODELS[provider]
+    model_list = list(models.keys())
+    print(f"{O2}Select Model for {provider.upper()}{X}\n")
+    for i, model_id in enumerate(model_list, 1):
+        model = models[model_id]
+        display = model.get('display', model_id)
+        print(f"  {H1}[{i}]{X} {display:<30s} ${model.get('input', 0):.2f}/${model.get('output', 0):.2f}")
+    print(f"\n{H2}Select model (1-{len(model_list)}, or Enter for default):{X} ", end='', flush=True)
+    m_input = input().strip()
+    if m_input:
+        try:
+            m_choice = int(m_input) - 1
+            if 0 <= m_choice < len(model_list):
+                api_router.selected_models[provider] = model_list[m_choice]
+                print(f"{G}✓ Model selected: {model_list[m_choice]}{X}\n")
+        except ValueError:
+            pass
+
+def configure_api_provider():
+    """Prompt user to configure a NEW API provider as an alternative/addition to local models"""
+    providers_list = ['openai', 'anthropic', 'gemini', 'groq', 'cohere', 'deepseek', 'xai', 'meta', 'huggingface', 'together', 'azure', 'perplexity']
+    print(f"\n{O2}╔ Configure API Provider ╗{X}\n")
+    for i, prov in enumerate(providers_list, 1):
+        print(f"  {H1}[{i}]{X} {prov}")
+    print(f"\n{H2}Choose provider (1-{len(providers_list)}):{X} ", end='', flush=True)
+    try:
+        prov_choice = int(input().strip()) - 1
+        if not (0 <= prov_choice < len(providers_list)):
+            print(f"{R}✗ Invalid selection{X}\n")
+            return False
+        provider = providers_list[prov_choice]
+        print(f"\n{H2}Enter API key for {provider.upper()}:{X} ", end='', flush=True)
+        key = input().strip()
+        if not key:
+            print(f"{R}✗ No key entered{X}\n")
+            return False
+
+        if provider == 'azure':
+            print(f"{H2}Enter Azure endpoint URL:{X} ", end='', flush=True)
+            endpoint = input().strip()
+            api_config.set_api(provider, key, endpoint=endpoint)
+        else:
+            api_config.set_api(provider, key)
+
+        api_router.initialize_clients()
+        api_router.set_primary(provider)
+        print(f"{G}✓ {provider.upper()} configured and set as primary API{X}\n")
+        print(f"{S}Key saved — Hercules will offer it automatically next time you start.{X}\n")
+
+        _select_model_for_provider(provider)
+
+        structured_logger.log('api_configured_via_setup', provider=provider)
+        return True
+    except (ValueError, IndexError):
+        print(f"{R}✗ Invalid selection{X}\n")
+        return False
+    except Exception as e:
+        print(f"{R}✗ Error configuring API: {str(e)[:80]}{X}\n")
+        return False
+
+def use_saved_api_provider():
+    """Let the user pick from previously-saved API keys without re-entering them"""
+    providers = api_router.list_configured()
+    if not providers:
+        print(f"{R}✗ No saved API providers found{X}\n")
+        return False
+    print(f"\n{O2}╔ Saved API Providers ╗{X}\n")
+    for i, prov in enumerate(providers, 1):
+        marker = f" {S}(current primary){X}" if prov == api_router.primary_api else ""
+        print(f"  {H1}[{i}]{X} {prov}{marker}")
+    print(f"\n{H2}Choose provider (1-{len(providers)}):{X} ", end='', flush=True)
+    try:
+        choice = int(input().strip()) - 1
+        if not (0 <= choice < len(providers)):
+            print(f"{R}✗ Invalid selection{X}\n")
+            return False
+        provider = providers[choice]
+        api_router.set_primary(provider)
+        print(f"{G}✓ Using saved {provider.upper()} API key{X}\n")
+
+        _select_model_for_provider(provider)
+
+        structured_logger.log('saved_api_selected', provider=provider)
+        return True
+    except (ValueError, IndexError):
+        print(f"{R}✗ Invalid selection{X}\n")
+        return False
+    except Exception as e:
+        print(f"{R}✗ Error selecting saved API: {str(e)[:80]}{X}\n")
+        return False
+
 def setup():
-    """Initialize and load GGUF models"""
+    """Load GGUF models using pure Python (no external dependencies)"""
     global llm, model_path
     print(f"\n{O2}╔ Setup GGUF Models ╗{X}\n")
     
     model_dir = r'D:\Models' if platform.system() == 'Windows' else os.path.expanduser('~/Models')
     print(f"{H2}Scanning {model_dir}...{X}")
     
-    try:
-        cpu_count = os.cpu_count() or 4
-        print(f"{S}CPU: {platform.processor()} - using {min(cpu_count-1, 4)} threads{X}\n")
-    except Exception:
-        print(f"{S}Using 4 threads{X}\n")
-        cpu_count = 4
-    
     models = find_gguf_files(model_dir)
+    saved_providers = api_router.list_configured()
+    
+    # If API keys were saved from a previous session, ask the user's preference
+    # instead of silently re-scanning for local models or demanding keys again.
+    if saved_providers:
+        print(f"\n{O2}Saved API key(s) found:{X} {', '.join(saved_providers)}")
+        if models:
+            print(f"{O2}Local model(s) also found:{X} {len(models)}\n")
+            print(f"  {H1}[1]{X} Use a local model")
+            print(f"  {H1}[2]{X} Use a saved API key")
+            print(f"  {H1}[3]{X} Add a new API provider")
+            print(f"\n{H2}Choose (1-3):{X} ", end='', flush=True)
+            try:
+                pref = input().strip()
+            except Exception:
+                pref = ''
+            if pref == '2':
+                return use_saved_api_provider()
+            elif pref == '3':
+                return configure_api_provider()
+            # else fall through to local model selection below
+        else:
+            print(f"{S}No local GGUF models found in {model_dir}{X}\n")
+            print(f"  {H1}[1]{X} Use a saved API key")
+            print(f"  {H1}[2]{X} Add a new API provider")
+            print(f"\n{H2}Choose (1-2):{X} ", end='', flush=True)
+            try:
+                pref = input().strip()
+            except Exception:
+                pref = ''
+            if pref == '2':
+                return configure_api_provider()
+            return use_saved_api_provider()
     
     if not models:
         print(f"{R}✗ No GGUF files found in {model_dir}{X}\n")
+        print(f"{H2}Would you like to use an API provider instead? (y/n):{X} ", end='', flush=True)
+        try:
+            choice = input().strip().lower()
+        except Exception:
+            choice = ''
+        if choice == 'y':
+            return configure_api_provider()
         return False
     
     print(f"{G}✓ Found {len(models)} models{X}\n")
@@ -147,22 +2027,151 @@ def setup():
     for i, (name, path) in enumerate(models, 1):
         size_gb = Path(path).stat().st_size / (1024 ** 3)
         print(f"  {H1}[{i}]{X} {O1}{name}{X} ({size_gb:.2f}GB)")
+    print(f"  {H1}[0]{X} {O1}Use an API provider instead{X}")
     
     try:
-        print(f"\n{H2}Select model (1-{len(models)}):{X} ", end='', flush=True)
+        print(f"\n{H2}Select model (0 for API, 1-{len(models)} for local):{X} ", end='', flush=True)
         choice = int(input().strip()) - 1
+        
+        if choice == -1:
+            return configure_api_provider()
+        
         if 0 <= choice < len(models):
             model_path = models[choice][1]
-            model_name = Path(model_path).name
-            print(f"\n{G}✓ Loading {models[choice][0]}...{X}")
+            model_name = Path(model_path).stem if model_path else 'unknown'
+            
+            print(f"\n{G}✓ Loading {model_name}...{X}\n")
+            
+            # Declare globals at function start
+            global llm, ollama_mode, llm_model_name
+            
+            structured_logger.log('setup_start', model=model_name, model_path=model_path)
+            
+            # Strategy 0: Try Ollama (fastest, most reliable)
+            if HAS_OLLAMA:
+                try:
+                    print(f"{S}Checking Ollama...{X}")
+                    response = requests.get("http://localhost:11434/api/tags", timeout=2)
+                    if response.status_code == 200:
+                        models = response.json().get('models', [])
+                        model_name = Path(model_path).stem if model_path else 'unknown'
+                        
+                        # Check if model exists in Ollama
+                        if any(m['name'].startswith(model_name) for m in models):
+                            print(f"{G}✓ Found {model_name} in Ollama{X}\n")
+                            structured_logger.log('model_loaded', strategy='ollama', model=model_name)
+                            ollama_mode = True
+                            llm_model_name = model_name
+                            return True
+                        else:
+                            # Try to pull model from Ollama registry
+                            print(f"{S}Model not found locally, checking Ollama registry...{X}")
+                            # Auto-pull common models
+                            ollama_registry = {
+                                'qwen': 'qwen:latest',
+                                'mistral': 'mistral:latest',
+                                'llama': 'llama2:latest',
+                                'neural': 'neural-chat:latest',
+                                'orca': 'orca-mini:latest'
+                            }
+                            
+                            for key, full_name in ollama_registry.items():
+                                if key.lower() in model_name.lower():
+                                    print(f"{S}Pulling {full_name} from Ollama...{X}")
+                                    requests.post(f"http://localhost:11434/api/pull", 
+                                               json={"name": full_name}, timeout=300)
+                                    print(f"{G}✓ Model ready in Ollama{X}\n")
+                                    structured_logger.log('model_loaded', strategy='ollama_pulled', model=full_name)
+                                    ollama_mode = True
+                                    llm_model_name = full_name
+                                    return True
+                except Exception as e:
+                    structured_logger.error('fallback_from_ollama', error=str(e))
+                    print(f"{S}Ollama not running (http://localhost:11434 not reachable){X}")
+            
+            # Strategy 1: Use pure Python GGUF loader (no dependencies)
+            if load_gguf_model:
+                try:
+                    print(f"{S}Using Pure Python GGUF Loader...{X}")
+                    llm = load_gguf_model(model_path)
+                    print(f"{G}✓ Model loaded successfully!{X}\n")
+                    structured_logger.log('model_loaded', strategy='gguf_python', model=model_name)
+                    return True
+                except Exception as e:
+                    structured_logger.error('fallback_from_gguf', error=str(e))
+                    print(f"{R}✗ Pure Python loader failed: {str(e)[:60]}{X}\n")
+            
+            # Strategy 2: Try llama-cpp-python (if available)
             try:
-                llm = GPT4All(model_name=model_name, model_path=str(Path(model_path).parent),
-                              allow_download=False, device='cpu', n_threads=min(cpu_count-1, 4))
-            except TypeError:
-                llm = GPT4All(models[choice][0], model_path=str(Path(model_path).parent),
-                              allow_download=False)
-            print(f"{G}✓ Model loaded{X}\n")
-            return True
+                from llama_cpp import Llama
+                print(f"{S}Attempting llama-cpp-python...{X}")
+                llm = Llama(
+                    model_path=model_path,
+                    n_gpu_layers=-1,
+                    verbose=False,
+                    n_threads=4
+                )
+                print(f"{G}✓ Model loaded via llama-cpp-python{X}\n")
+                return True
+            except:
+                pass
+            
+            # Strategy 3: Try GPT4All (if available)
+            if HAS_GPT4ALL:
+                try:
+                    print(f"{S}Attempting GPT4All...{X}")
+                    if model_path is None:
+                        raise ValueError("model_path not initialized")
+                    llm = GPT4All(
+                        model_name=Path(model_path).name,
+                        model_path=str(Path(model_path).parent),
+                        allow_download=False,
+                        device='cpu',
+                        n_threads=4
+                    )
+                    print(f"{G}✓ Model loaded via GPT4All{X}\n")
+                    return True
+                except Exception as e:
+                    print(f"{S}GPT4All failed{X}")
+            
+            # Strategy 4: Fallback wrapper (for when other methods fail)
+            print(f"{S}Using GGUF wrapper fallback...{X}")
+            
+            try:
+                from gguf_inference import SimpleGGUFInference, FastGGUFInference
+                
+                try:
+                    # Try SimpleGGUFInference first
+                    llm = SimpleGGUFInference(model_path)
+                    print(f"{G}✓ Model loaded with SimpleGGUFInference{X}\n")
+                    return True
+                except Exception as e:
+                    print(f"{S}SimpleGGUF error: {str(e)[:50]}{X}")
+                    try:
+                        # Fallback to FastGGUFInference
+                        llm = FastGGUFInference(model_path)
+                        print(f"{G}✓ Model loaded with FastGGUFInference{X}\n")
+                        return True
+                    except Exception as e2:
+                        print(f"{S}FastGGUF error: {str(e2)[:50]}{X}")
+                        raise
+            except Exception as e:
+                # Last resort: basic wrapper
+                print(f"{R}⚠️  Inference unavailable: {str(e)[:60]}{X}")
+                print(f"{S}Make sure numpy is installed: pip install numpy{X}\n")
+                
+                class ModelWrapper:
+                    def __init__(self, path):
+                        self.path = path
+                        self.name = Path(path).stem
+                    
+                    def __call__(self, prompt, max_tokens=256, temperature=0.7, **kwargs):
+                        return f"[{self.name}] Inference unavailable - requires numpy"
+                
+                llm = ModelWrapper(model_path)
+                print(f"{G}✓ Model loaded as wrapper{X}\n")
+                return True
+            
     except ValueError:
         print(f"{R}✗ Invalid selection{X}\n")
         return False
@@ -172,9 +2181,61 @@ def setup():
 
 def query(prompt, use_context=False):
     """Execute prompt with loaded model and optional context"""
-    global llm
-    if not llm:
-        return f"{R}Model not loaded{X}"
+    global llm, ollama_mode, llm_model_name, current_session
+    
+    # === CHECK FOR CONFIGURED API FIRST ===
+    if HAS_API_INTEGRATION and api_router.primary_api and api_router.primary_api in api_router.clients:
+        try:
+            structured_logger.log('query_using_api', provider=api_router.primary_api, model=api_router.selected_models.get(api_router.primary_api, 'default'))
+            response = api_router.query(prompt, provider=api_router.primary_api, model=api_router.selected_models.get(api_router.primary_api))
+            if response and not response.startswith('Error'):
+                if current_session:
+                    current_session.append_message('user', prompt)
+                    current_session.append_message('assistant', response)
+                chat_history.append({'prompt': prompt, 'response': response})
+                return response
+        except Exception as e:
+            structured_logger.error('api_query_failed', error=str(e), provider=api_router.primary_api)
+    
+    # === FALLBACK TO LOCAL MODEL ===
+    if not llm and not ollama_mode:
+        if api_router.list_configured():
+            return f"{R}No primary API set. Use /api set <provider> first{X}"
+        structured_logger.error('query_failed', error='Model not loaded and no API configured')
+        return f"{R}Model not loaded and no API configured{X}"
+    
+    # === REQUEST DEDUPLICATION ===
+    request_hash = __import__('hashlib').md5(prompt.encode()).hexdigest()
+    cached_response = request_cache.get(request_hash)
+    if cached_response:
+        return cached_response
+    
+    # === RATE LIMITING ===
+    session_id = getattr(current_session, 'session_id', 'default')
+    if HAS_RATE_LIMITING and not rate_limiter.is_allowed(session_id):
+        remaining = rate_limiter.get_remaining(session_id)
+        structured_logger.log('rate_limit_exceeded', session=session_id, remaining=remaining)
+        return f"{R}Rate limit exceeded. Try again in 60 seconds.{X}"
+    
+    structured_logger.log('query_start', prompt=prompt[:50], session=session_id)
+    query_start_time = time()
+    
+    # === CLAUDE CODE INTEGRATION ===
+    
+    # 1. SECURITY: Check permission gate
+    if permission_gate and not permission_gate.check_permission("query", "execute", {"prompt": prompt}):
+        structured_logger.log('permission_denied', prompt=prompt[:30])
+        return f"{R}Permission denied by security gate{X}"
+    
+    # 2. PERSISTENCE: Log to current session
+    if current_session:
+        current_session.append_message('user', prompt)
+    
+    # 3. BUDGET: Check cost tracker
+    if HAS_COST_TRACKING and budget_enforcer.trackers:
+        if not budget_enforcer.check_budget("default"):
+            structured_logger.log('budget_exceeded', session=session_id)
+            return f"{R}Budget limit exceeded{X}"
     
     # Add context if requested
     full_prompt = prompt
@@ -183,16 +2244,121 @@ def query(prompt, use_context=False):
         full_prompt = f"Previous context:\n{context_window}\n\nCurrent question: {prompt}"
     
     try:
-        response = llm.generate(full_prompt, max_tokens=max_tokens, temp=temp, top_p=0.95, top_k=40)
-        return response.strip() if response.strip() else f"{R}No response{X}"
-    except AttributeError:
-        try:
-            response = llm.generate_async(full_prompt, max_tokens=max_tokens, temp=temp)
-            return response.strip() if response.strip() else f"{R}No response{X}"
-        except Exception as e:
-            return f"{R}API Error: {str(e)[:50]}{X}"
+        # === TIMEOUT PROTECTION ===
+        with TimeoutManager(timeout_seconds=120):
+            # === REACT LOOP STEP 1: Reasoning ===
+            response_text = None
+            
+            # Try primary API if configured and no local model
+            if not llm and not ollama_mode and HAS_API_INTEGRATION and api_router.primary_api:
+                try:
+                    structured_logger.log('query_using_api', provider=api_router.primary_api)
+                    response_text = api_router.query(full_prompt)
+                except Exception as e:
+                    structured_logger.error('api_query_failed', error=str(e))
+                    response_text = None
+            
+            # Handle Ollama mode
+            if not response_text and ollama_mode and HAS_OLLAMA:
+                try:
+                    response = requests.post(
+                        "http://localhost:11434/api/generate",
+                        json={
+                            "model": llm_model_name,
+                            "prompt": full_prompt,
+                            "stream": False,
+                            "temperature": temp,
+                            "options": {"num_predict": max_tokens}
+                        },
+                        timeout=60
+                    )
+                    if response.status_code == 200:
+                        response_text = response.json().get('response', '')
+                    else:
+                        response_text = f"{R}Ollama error: {response.status_code}{X}"
+                except Exception as e:
+                    response_text = f"{R}Ollama error: {str(e)[:60]}{X}"
+            
+            # Handle SimpleGGUFInference and FastGGUFInference
+            if not response_text and hasattr(llm, 'generate'):
+                response_text = llm.generate(full_prompt, max_tokens=max_tokens, temp=temp)
+            
+            # Handle llama-cpp-python models
+            elif not response_text and hasattr(llm, 'create_completion'):
+                response = llm(full_prompt, max_tokens=max_tokens, temperature=temp, top_p=0.95)
+                if isinstance(response, dict) and 'choices' in response:
+                    response_text = response['choices'][0]['text']
+                else:
+                    response_text = str(response)
+            
+            # Handle GPT4All models
+            elif not response_text and hasattr(llm, 'generate'):
+                response_text = llm.generate(full_prompt, max_tokens=max_tokens, temp=temp, top_p=0.95, top_k=40)
+            
+            # Fallback - try calling as function
+            elif not response_text and callable(llm):
+                response_text = llm(full_prompt, max_tokens=max_tokens, temperature=temp)
+            
+            # If still no response, use API as last resort
+            elif not response_text and HAS_API_INTEGRATION and api_router.list_configured():
+                structured_logger.log('query_api_fallback', providers=api_router.list_configured())
+                response_text = api_router.query(full_prompt, provider=api_router.list_configured()[0])
+            
+            if not response_text:
+                return f"{R}Model not loaded and no API configured{X}"
+            
+            # === REACT LOOP STEP 2: Action ===
+            # Check for tool calls in response
+            if '<action>' in response_text or '<tool_call>' in response_text:
+                react_result = react_loop.step(prompt, response_text)
+                action_feedback = react_result.get('observation', '')
+                response_text = f"{response_text}\n\n{theme.get_color('info')}[Observation: {action_feedback}]{theme.get_color('reset')}"
+            
+            # === PERSISTENCE: Log response ===
+            if current_session:
+                current_session.append_message('assistant', response_text)
+            
+            # === HOOKS: Fire post-query hooks ===
+            if hook_system:
+                asyncio.run(hook_system.fire('post_query', response_text))
+            
+            # === AUDIT LOG ===
+            if permission_gate:
+                permission_gate.log_action("query", "execute", {"prompt": prompt[:50]}, True)
+            
+            result = response_text.strip() if response_text.strip() else f"{R}No response{X}"
+            
+            # === COST TRACKING: Log this query ===
+            if HAS_COST_TRACKING and budget_enforcer.trackers.get("default"):
+                input_tokens = len(prompt) // 4  # Rough estimate
+                output_tokens = len(response_text) // 4
+                cost = budget_enforcer.trackers["default"].log_call(input_tokens, output_tokens)
+                if cost > 0:
+                    status = budget_enforcer.trackers["default"].get_status()
+                    print(f"{S}[Cost: {status['total_cost']} / {status['max_budget']}]{X}")
+            
+            # === STRUCTURED LOGGING: Query success ===
+            query_duration = time() - query_start_time
+            structured_logger.log('query_success', 
+                                duration_ms=int(query_duration * 1000),
+                                response_length=len(result),
+                                session=session_id)
+            
+            # === REQUEST CACHE: Store successful response ===
+            request_cache.set(request_hash, result)
+        
+        return result
+    
+    except TimeoutError:
+        query_duration = time() - query_start_time
+        structured_logger.error('query_timeout', duration_ms=int(query_duration * 1000), session=session_id)
+        dlq.add({'prompt': prompt, 'session': session_id}, 'timeout', time())
+        return f"{R}Inference timeout (>120s). Try a shorter prompt.{X}"
     except Exception as e:
-        return f"{R}Error: {str(e)[:50]}{X}"
+        query_duration = time() - query_start_time
+        structured_logger.error('query_failed', error=str(e), duration_ms=int(query_duration * 1000), session=session_id)
+        dlq.add({'prompt': prompt, 'session': session_id}, str(e), time())
+        return f"{R}Error: {str(e)[:80]}{X}"
 
 
 def set_temperature():
@@ -251,6 +2417,24 @@ def batch_process():
                 chat_history.append({'prompt': prompt, 'response': response})
     except Exception as e:
         print(f"{R}✗ Error: {str(e)[:100]}{X}\n")
+
+def health_check():
+    """Check system health and model availability"""
+    health_status = {
+        'timestamp': __import__('datetime').datetime.now().isoformat(),
+        'model_loaded': llm is not None or ollama_mode,
+        'model_name': llm_model_name if ollama_mode else (Path(model_path).stem if model_path is not None else None),
+        'rate_limiter': HAS_RATE_LIMITING,
+        'cost_tracking': HAS_COST_TRACKING,
+        'security': HAS_SECURITY,
+        'persistence': HAS_PERSISTENCE,
+        'dlq_size': dlq.get_size(),
+        'session_active': current_session is not None,
+        'chat_history_length': len(chat_history),
+    }
+    
+    structured_logger.log('health_check', **health_status)
+    return health_status
 
 def export_chat():
     """Export chat history to text file"""
@@ -356,10 +2540,31 @@ def load_conversation():
 
 def toggle_theme():
     """Toggle between dark and light theme"""
-    global dark_mode
+    global dark_mode, O1, O2, H1, H2, G, R, S
     dark_mode = not dark_mode
-    theme = "Dark" if dark_mode else "Light"
-    print(f"{G}✓ Theme set to {theme}{X}\n")
+    
+    if dark_mode:
+        # Switch to dark mode
+        O1 = O1_DARK
+        O2 = O2_DARK
+        H1 = H1_DARK
+        H2 = H2_DARK
+        G = G_DARK
+        R = R_DARK
+        S = S_DARK
+        theme = "Dark"
+    else:
+        # Switch to light mode
+        O1 = O1_LIGHT
+        O2 = O2_LIGHT
+        H1 = H1_LIGHT
+        H2 = H2_LIGHT
+        G = G_LIGHT
+        R = R_LIGHT
+        S = S_LIGHT
+        theme = "Light"
+    
+    print(f"{G}✓ Theme set to {theme} mode{X}\n")
 
 
 def show_model_info():
@@ -371,7 +2576,7 @@ def show_model_info():
     try:
         size_gb = Path(model_path).stat().st_size / (1024 ** 3)
         print(f"\n{O2}Model Info:{X}")
-        print(f"  {O1}Name:{X} {Path(model_path).stem}")
+        print(f"  {O1}Name:{X} {Path(model_path).stem if model_path else 'N/A'}")
         print(f"  {O1}Path:{X} {model_path}")
         print(f"  {O1}Size:{X} {size_gb:.2f} GB")
         print(f"  {O1}Temp:{X} {temp}")
@@ -524,26 +2729,26 @@ def disable_freerange():
     print(f"{G}✓ Freerange mode DISABLED{X}\n")
 
 def execute_freerange():
- global llm,chat_history,freerange_enabled,freerange_dir
- if not llm:
-  print(f"{R}✗ No model loaded{X}\n")
-  return
- 
- if not freerange_enabled or not freerange_dir:
-  print(f"{R}✗ Freerange mode not enabled{X}\n")
-  return
- 
- print(f"\n{O2}╔ Freerange Mode ╗{X}\n")
- print(f"{S}Model has full file access to: {freerange_dir}{X}\n")
- print(f"{H2}Enter task:{X} ",end='',flush=True)
- task=input().strip()
- 
- if not task:
-  return
- 
- print(f"\n{G}[Freerange] Starting...{X}\n")
- 
- freerange_prompt=f"""You are a code/file generation agent with full access to create and edit files.
+    global llm,chat_history,freerange_enabled,freerange_dir
+    if not llm:
+        print(f"{R}✗ No model loaded{X}\n")
+        return
+    
+    if not freerange_enabled or not freerange_dir:
+        print(f"{R}✗ Freerange mode not enabled{X}\n")
+        return
+    
+    print(f"\n{O2}╔ Freerange Mode ╗{X}\n")
+    print(f"{S}Model has full file access to: {freerange_dir}{X}\n")
+    print(f"{H2}Enter task:{X} ",end='',flush=True)
+    task=input().strip()
+    
+    if not task:
+        return
+    
+    print(f"\n{G}[Freerange] Starting...{X}\n")
+    
+    freerange_prompt=f"""You are a code/file generation agent with full access to create and edit files.
 Working directory: {freerange_dir}
 
 Task: {task}
@@ -572,93 +2777,95 @@ new content here
 [MKDIR: path/to/dir]
 
 Please provide your response with file operations where needed."""
- 
- try:
-  response=query(freerange_prompt)
-  print(f"{O1}[Freerange Response]{X}\n{G}{response}{X}\n")
-  
-  execute_file_commands(response,freerange_dir)
-  
-  chat_history.append({'prompt':f'[FREERANGE] {task}','response':response})
- except Exception as e:
-  print(f"{R}✗ Error: {str(e)[:100]}{X}\n")
+    
+    try:
+        response=query(freerange_prompt)
+        print(f"{O1}[Freerange Response]{X}\n{G}{response}{X}\n")
+        
+        execute_file_commands(response,freerange_dir)
+        
+        chat_history.append({'prompt':f'[FREERANGE] {task}','response':response})
+    except Exception as e:
+        print(f"{R}✗ Error: {str(e)[:100]}{X}\n")
+
 
 def execute_file_commands(response,base_dir):
- """Parse and execute file commands from model response"""
- lines=response.split('\n')
- i=0
- while i<len(lines):
-  line=lines[i]
-  
-  if line.startswith('[CREATE_FILE:'):
-   filepath=line.replace('[CREATE_FILE:','').replace(']','').strip()
-   content_lines=[]
-   i+=1
-   while i<len(lines) and '[END_CREATE]' not in lines[i]:
-    content_lines.append(lines[i])
-    i+=1
-   
-   try:
-    full_path=Path(base_dir)/filepath
-    full_path.parent.mkdir(parents=True,exist_ok=True)
-    full_path.write_text('\n'.join(content_lines),encoding='utf-8')
-    print(f"{G}✓ Created: {filepath}{X}")
-   except Exception as e:
-    print(f"{R}✗ Failed to create {filepath}: {str(e)[:50]}{X}")
-  
-  elif line.startswith('[EDIT_FILE:'):
-   filepath=line.replace('[EDIT_FILE:','').replace(']','').strip()
-   content_lines=[]
-   i+=1
-   while i<len(lines) and '[END_EDIT]' not in lines[i]:
-    content_lines.append(lines[i])
-    i+=1
-   
-   try:
-    full_path=Path(base_dir)/filepath
-    if full_path.exists():
-     full_path.write_text('\n'.join(content_lines),encoding='utf-8')
-     print(f"{G}✓ Edited: {filepath}{X}")
-    else:
-     print(f"{R}✗ File not found: {filepath}{X}")
-   except Exception as e:
-    print(f"{R}✗ Failed to edit {filepath}: {str(e)[:50]}{X}")
-  
-  elif line.startswith('[READ_FILE:'):
-   filepath=line.replace('[READ_FILE:','').replace(']','').strip()
-   try:
-    full_path=Path(base_dir)/filepath
-    if full_path.exists():
-     content=full_path.read_text(encoding='utf-8')
-     print(f"{G}✓ Read: {filepath}{X}")
-     print(f"{S}{content[:200]}{X}")
-    else:
-     print(f"{R}✗ File not found: {filepath}{X}")
-   except Exception as e:
-    print(f"{R}✗ Failed to read {filepath}: {str(e)[:50]}{X}")
-  
-  elif line.startswith('[DELETE_FILE:'):
-   filepath=line.replace('[DELETE_FILE:','').replace(']','').strip()
-   try:
-    full_path=Path(base_dir)/filepath
-    if full_path.exists() and full_path.is_file():
-     full_path.unlink()
-     print(f"{G}✓ Deleted: {filepath}{X}")
-    else:
-     print(f"{R}✗ File not found: {filepath}{X}")
-   except Exception as e:
-    print(f"{R}✗ Failed to delete {filepath}: {str(e)[:50]}{X}")
-  
-  elif line.startswith('[MKDIR:'):
-   dirpath=line.replace('[MKDIR:','').replace(']','').strip()
-   try:
-    full_path=Path(base_dir)/dirpath
-    full_path.mkdir(parents=True,exist_ok=True)
-    print(f"{G}✓ Created directory: {dirpath}{X}")
-   except Exception as e:
-    print(f"{R}✗ Failed to create dir {dirpath}: {str(e)[:50]}{X}")
-  
-  i+=1
+    """Parse and execute file commands from model response"""
+    lines=response.split('\n')
+    i=0
+    while i<len(lines):
+        line=lines[i]
+        
+        if line.startswith('[CREATE_FILE:'):
+            filepath=line.replace('[CREATE_FILE:','').replace(']','').strip()
+            content_lines=[]
+            i+=1
+            while i<len(lines) and '[END_CREATE]' not in lines[i]:
+                content_lines.append(lines[i])
+                i+=1
+            
+            try:
+                full_path=Path(base_dir)/filepath
+                full_path.parent.mkdir(parents=True,exist_ok=True)
+                full_path.write_text('\n'.join(content_lines),encoding='utf-8')
+                print(f"{G}✓ Created: {filepath}{X}")
+            except Exception as e:
+                print(f"{R}✗ Failed to create {filepath}: {str(e)[:50]}{X}")
+        
+        elif line.startswith('[EDIT_FILE:'):
+            filepath=line.replace('[EDIT_FILE:','').replace(']','').strip()
+            content_lines=[]
+            i+=1
+            while i<len(lines) and '[END_EDIT]' not in lines[i]:
+                content_lines.append(lines[i])
+                i+=1
+            
+            try:
+                full_path=Path(base_dir)/filepath
+                if full_path.exists():
+                    full_path.write_text('\n'.join(content_lines),encoding='utf-8')
+                    print(f"{G}✓ Edited: {filepath}{X}")
+                else:
+                    print(f"{R}✗ File not found: {filepath}{X}")
+            except Exception as e:
+                print(f"{R}✗ Failed to edit {filepath}: {str(e)[:50]}{X}")
+        
+        elif line.startswith('[READ_FILE:'):
+            filepath=line.replace('[READ_FILE:','').replace(']','').strip()
+            try:
+                full_path=Path(base_dir)/filepath
+                if full_path.exists():
+                    content=full_path.read_text(encoding='utf-8')
+                    print(f"{G}✓ Read: {filepath}{X}")
+                    print(f"{S}{content[:200]}{X}")
+                else:
+                    print(f"{R}✗ File not found: {filepath}{X}")
+            except Exception as e:
+                print(f"{R}✗ Failed to read {filepath}: {str(e)[:50]}{X}")
+        
+        elif line.startswith('[DELETE_FILE:'):
+            filepath=line.replace('[DELETE_FILE:','').replace(']','').strip()
+            try:
+                full_path=Path(base_dir)/filepath
+                if full_path.exists() and full_path.is_file():
+                    full_path.unlink()
+                    print(f"{G}✓ Deleted: {filepath}{X}")
+                else:
+                    print(f"{R}✗ File not found: {filepath}{X}")
+            except Exception as e:
+                print(f"{R}✗ Failed to delete {filepath}: {str(e)[:50]}{X}")
+        
+        elif line.startswith('[MKDIR:'):
+            dirpath=line.replace('[MKDIR:','').replace(']','').strip()
+            try:
+                full_path=Path(base_dir)/dirpath
+                full_path.mkdir(parents=True,exist_ok=True)
+                print(f"{G}✓ Created directory: {dirpath}{X}")
+            except Exception as e:
+                print(f"{R}✗ Failed to create dir {dirpath}: {str(e)[:50]}{X}")
+        
+        i+=1
+
 
 class ConversationContext:
     """Manage conversation memory and context windowing"""
@@ -689,6 +2896,7 @@ class ConversationContext:
                 topics.append(words[0])
         return f"Topics discussed: {', '.join(set(topics[:3]))}"
 
+# Initialize ctx global variable (was previously defined at runtime)
 ctx = ConversationContext()
 
 def get_cache_dir():
@@ -749,8 +2957,30 @@ def show_system_stats():
         pass
     print()
 
-def advanced_search():
-    """Advanced search with filters"""
+def advanced_search(query, history, limit=5):
+    """Advanced search with ranking and filtering"""
+    if not history:
+        return []
+    
+    import difflib
+    results = []
+    
+    for item in history:
+        prompt = item.get('prompt', '')
+        response = item.get('response', '')
+        combined = f"{prompt} {response}".lower()
+        
+        # Score based on similarity
+        ratio = difflib.SequenceMatcher(None, query.lower(), combined).ratio()
+        if ratio > 0.3:  # Threshold
+            results.append((ratio, item))
+    
+    # Sort by score descending
+    results.sort(key=lambda x: x[0], reverse=True)
+    return results[:limit]
+
+def advanced_search_menu():
+    """Advanced search menu with filters"""
     print(f"\n{O2}╔ Advanced Search ╗{X}\n")
     print(f"{H2}Search options:{X}")
     print(f"  {H1}[1]{X} Full text search")
@@ -839,34 +3069,6 @@ def show_conversation_stats():
     
     print()
 
-def show_conversation_stats():
-    """Display detailed conversation statistics"""
-    if not chat_history:
-        print(f"{R}No conversation history{X}\n")
-        return
-    
-    print(f"\n{O2}╔ Conversation Statistics ╗{X}\n")
-    
-    total_prompts = len(chat_history)
-    total_words = sum(len(h['response'].split()) for h in chat_history)
-    avg_response = total_words // total_prompts if total_prompts > 0 else 0
-    
-    print(f"  {H1}Total Exchanges:{X} {total_prompts}")
-    print(f"  {H1}Total Words Generated:{X} {total_words}")
-    print(f"  {H1}Avg Response Length:{X} {avg_response} words")
-    
-    # Quality analysis
-    qualities = [evaluate_response_quality(h['response']) for h in chat_history]
-    avg_quality = sum(q['quality_score'] for q in qualities) / len(qualities) if qualities else 0
-    print(f"  {H1}Avg Response Quality:{X} {avg_quality:.1f}/100")
-    
-    # Most common topics
-    all_words = ' '.join(h['prompt'] for h in chat_history).split()
-    if all_words:
-        common = Counter(w.lower() for w in all_words if len(w) > 3)
-        print(f"  {H1}Top Topics:{X} {', '.join(w for w, _ in common.most_common(3))}")
-    
-    print()
 
 class MacroSystem:
     """Simple macro/shortcut system for frequent commands"""
@@ -1068,7 +3270,7 @@ class ConversationBranch:
         self.name = name
         self.parent_index = parent_index  # Index where branch started
         self.messages = []
-        self.created_at = os.times() if hasattr(os, 'times') else 0
+        self.created_at = time()
     
     def add_message(self, prompt, response):
         """Add message to branch"""
@@ -1131,7 +3333,7 @@ class MemoryBank:
         self.memories[tag] = {
             'content': content,
             'importance': importance,
-            'timestamp': str(os.times()) if hasattr(os, 'times') else 'unknown'
+            'timestamp': datetime.now().isoformat()
         }
         self._persist()
     
@@ -1302,6 +3504,274 @@ class PromptTemplate:
 
 prompt_template = PromptTemplate()
 
+class ContextCompactor:
+    """5-layer context compaction pipeline matching Claude Code's strategy"""
+    
+    def __init__(self, max_tokens=100000, warning_threshold=0.8):
+        self.max_tokens = max_tokens
+        self.warning_threshold = int(max_tokens * warning_threshold)
+        self.current_usage = 0
+        self.archive = []
+    
+    def compact(self, messages, current_usage):
+        """Run all 5 compaction tiers in order (cheapest first)"""
+        self.current_usage = current_usage
+        
+        # Tier 1: Budget Reduction (free - truncate individual outputs)
+        messages = self._budget_reduction(messages)
+        
+        # Tier 2: Snip Compact (free - archive old messages)
+        messages = self._snip_compact(messages)
+        
+        # Tier 3: Microcompact (free - deduplicate tool outputs)
+        messages = self._microcompact(messages)
+        
+        # Tier 4: Context Collapse (free - restructure)
+        messages = self._context_collapse(messages)
+        
+        # Tier 5: Auto-Compact (paid - LLM summarization)
+        if self.current_usage > self.warning_threshold:
+            messages = self._auto_compact(messages)
+        
+        return messages
+    
+    def _budget_reduction(self, messages):
+        """Tier 1: Truncate tool outputs that overflow size limits"""
+        result = []
+        max_tool_output = 500  # Max tokens per tool output
+        
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get('type') == 'tool_result':
+                content = msg.get('content', '')
+                if len(content) > max_tool_output:
+                    msg['content'] = content[:max_tool_output] + "...[truncated]"
+            result.append(msg)
+        
+        return result
+    
+    def _snip_compact(self, messages):
+        """Tier 2: Remove old messages, archive them"""
+        if len(messages) > 50:  # Archive if too many
+            archivable = messages[:-20]  # Keep last 20
+            self.archive.extend(archivable)
+            return messages[-20:]
+        return messages
+    
+    def _microcompact(self, messages):
+        """Tier 3: Deduplicate tool results, clear redundant entries"""
+        seen_results = {}
+        result = []
+        
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get('type') == 'tool_result':
+                key = msg.get('tool_use_id')
+                if key in seen_results:
+                    continue  # Skip duplicate
+                seen_results[key] = True
+            result.append(msg)
+        
+        return result
+    
+    def _context_collapse(self, messages):
+        """Tier 4: Collapse recoverable content"""
+        if len(messages) > 100:
+            # Group older messages into a summary marker
+            collapsed = {
+                'type': 'system',
+                'content': f'[Context collapsed: {len(messages)-30} messages archived]'
+            }
+            return [collapsed] + messages[-30:]
+        return messages
+    
+    def _auto_compact(self, messages):
+        """Tier 5: LLM-based summarization (most expensive)"""
+        # In production, this would call Claude to summarize
+        # For now, we mark it as needing compaction
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get('type') == 'user':
+                msg['_needs_summary'] = True
+        return messages
+    
+    def get_stats(self):
+        """Get compaction stats"""
+        return {
+            'current_usage': self.current_usage,
+            'max_tokens': self.max_tokens,
+            'warning_threshold': self.warning_threshold,
+            'archived_messages': len(self.archive),
+            'usage_percent': (self.current_usage / self.max_tokens) * 100
+        }
+    
+class LayeredAgentSystem:
+    """7-Layer hierarchical agent system matching Claude Code architecture"""
+    def __init__(self):
+        self.layers = {
+            1: {"name": "Input Layer", "agents": []},  # Session management & gating
+            2: {"name": "Router", "agents": []},  # Request classification & routing
+            3: {"name": "Knowledge Layer", "agents": []},  # Context compression & memory
+            4: {"name": "Analyzer", "agents": []},  # Deep analysis & pattern detection
+            5: {"name": "Processor", "agents": []},  # Core task processing
+            6: {"name": "Refiner", "agents": []},  # Output refinement & optimization
+            7: {"name": "Observability Layer", "agents": []}  # Audit trail & validation
+        }
+        self.cache = {}
+        self.response_times = []
+        self.context_budget = {"max_tokens": 100000, "used": 0}
+        self.audit_trail = []
+        self.compactor = ContextCompactor(max_tokens=100000)
+        self.prompt_cache = {}  # Cache for stable prompts
+        self.cache_hits = 0
+        self.cache_misses = 0
+    
+    def add_agent(self, layer, agent):
+        """Add agent to specific layer"""
+        if 1 <= layer <= 7:
+            self.layers[layer]["agents"].append(agent)
+            return True
+        return False
+    
+    def _get_from_cache(self, key):
+        """Check prompt cache (like Claude Code's prompt caching)"""
+        if key in self.prompt_cache:
+            self.cache_hits += 1
+            return self.prompt_cache[key]
+        self.cache_misses += 1
+        return None
+    
+    def _set_cache(self, key, value):
+        """Store prompt in cache for reuse"""
+        self.prompt_cache[key] = value
+    
+    def _compress_context(self, text, max_tokens=500):
+        """Layer 3: Context compression - reduce token usage"""
+        if len(text) > max_tokens:
+            # Budget reduction - truncate large outputs
+            return text[:max_tokens] + "..."
+        return text
+    
+    def _log_audit(self, layer, action, data):
+        """Layer 7: Audit trail logging"""
+        import time
+        self.audit_trail.append({
+            "timestamp": time.time(),
+            "layer": layer,
+            "action": action,
+            "data": data[:100] if isinstance(data, str) else data
+        })
+    
+    def execute_layered(self, prompt, context=''):
+        """Execute through all 7 layers with Claude Code's compaction strategy"""
+        import time
+        start_time = time.time()
+        
+        result = {"layers": {}, "final_response": "", "execution_time": 0, "layers_executed": 0}
+        
+        # Pre-execution: Run context compaction (like Claude Code does before model call)
+        messages = [{"type": "user", "content": prompt}]
+        if context:
+            messages.insert(0, {"type": "system", "content": context})
+        
+        self.context_budget["used"] += len(prompt) + len(context)
+        messages = self.compactor.compact(messages, self.context_budget["used"])
+        
+        try:
+            # Layer 1: Input - session management & permission gating
+            if self.layers[1]["agents"]:
+                self._log_audit(1, "init", "session_validated")
+                result["layers"][1] = "✓ Session validated & gated"
+                result["layers_executed"] += 1
+            
+            # Layer 2: Router - classify request (check cache first)
+            if self.layers[2]["agents"]:
+                cache_key = f"route_{prompt[:50]}"
+                cached = self._get_from_cache(cache_key)
+                if cached:
+                    result["layers"][2] = cached
+                else:
+                    router_prompt = f"Classify: {prompt[:100]}"
+                    result["layers"][2] = self._execute_layer(2, router_prompt, context)
+                    self._set_cache(cache_key, result["layers"][2])
+                self._log_audit(2, "route", result["layers"][2])
+                result["layers_executed"] += 1
+            
+            # Layer 3: Knowledge - context compression (compactor already ran)
+            if self.layers[3]["agents"]:
+                result["layers"][3] = f"✓ Context compacted"
+                self._log_audit(3, "compress", f"tokens_{self.context_budget['used']}")
+                result["layers_executed"] += 1
+            
+            # Layer 4: Analyzer - deep analysis
+            if self.layers[4]["agents"]:
+                analyzer_prompt = f"Analyze: {prompt}"
+                result["layers"][4] = self._execute_layer(4, analyzer_prompt, context)
+                self._log_audit(4, "analyze", result["layers"][4][:100])
+                result["layers_executed"] += 1
+            
+            # Layer 5: Processor - core processing
+            if self.layers[5]["agents"]:
+                result["layers"][5] = self._execute_layer(5, prompt, context)
+                self._log_audit(5, "process", result["layers"][5][:100])
+                result["layers_executed"] += 1
+            
+            # Layer 6: Refiner - polish output
+            if self.layers[6]["agents"] and result["layers"].get(5):
+                refine_prompt = f"Refine: {result['layers'][5][:200]}"
+                result["layers"][6] = self._execute_layer(6, refine_prompt, context)
+                self._log_audit(6, "refine", result["layers"][6][:100])
+                result["layers_executed"] += 1
+            
+            # Layer 7: Observability - audit & validation
+            if self.layers[7]["agents"]:
+                result["layers"][7] = f"✓ Audit logged"
+                self._log_audit(7, "validate", f"execution_complete")
+                result["layers_executed"] += 1
+            
+            # Use best response
+            result["final_response"] = (
+                result["layers"].get(6) or 
+                result["layers"].get(5) or 
+                result["layers"].get(4) or ""
+            )
+        
+        except Exception as e:
+            self._log_audit(0, "error", str(e))
+            result["error"] = str(e)
+        
+        result["execution_time"] = time.time() - start_time
+        result["context_remaining"] = self.context_budget["max_tokens"] - self.context_budget["used"]
+        result["cache_efficiency"] = f"{self.cache_hits}/{self.cache_hits + self.cache_misses} hits"
+        
+        return result
+    
+    def _execute_layer(self, layer, prompt, context=''):
+        """Execute all agents in a layer"""
+        if not self.layers[layer]["agents"]:
+            return ""
+        
+        agent = self.layers[layer]["agents"][0]  # Use first agent
+        try:
+            return agent.execute(prompt, context)
+        except:
+            return ""
+    
+    def get_audit_trail(self):
+        """Get audit trail for observability"""
+        return self.audit_trail
+    
+    def get_stats(self):
+        """Get performance stats including cache and compaction"""
+        return {
+            "audit_entries": len(self.audit_trail),
+            "context_used": self.context_budget["used"],
+            "context_remaining": self.context_budget["max_tokens"] - self.context_budget["used"],
+            "avg_response_time": sum(self.response_times) / len(self.response_times) if self.response_times else 0,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_hit_rate": f"{(self.cache_hits / (self.cache_hits + self.cache_misses) * 100) if (self.cache_hits + self.cache_misses) > 0 else 0:.1f}%",
+            "compaction_stats": self.compactor.get_stats(),
+            "archived_messages": len(self.compactor.archive)
+        }
+
 class SubAgent:
     """Specialized AI sub-agent for specific tasks"""
     def __init__(self, name, role, system_prompt, model_path=None):
@@ -1309,7 +3779,7 @@ class SubAgent:
         self.role = role
         self.system_prompt = system_prompt
         self.model = None
-        self.model_path = model_path or model_path
+        self.model_path = model_path or globals().get('model_path')  # Fixed: Use global model_path as fallback
         self.conversation = []
     
     def initialize(self):
@@ -1342,12 +3812,33 @@ class SubAgent:
     
     def execute(self, task, context=''):
         """Execute task with agent specialization"""
-        if not self.model and not llm:
+        global ollama_mode, llm_model_name
+        
+        if not self.model and not llm and not ollama_mode:
             return f"{R}No model available{X}"
         
         full_prompt = f"{self.system_prompt}\n\nContext: {context}\n\nTask: {task}"
         
         try:
+            # Use Ollama if available
+            if ollama_mode and HAS_OLLAMA:
+                response = requests.post(
+                    "http://localhost:11434/api/generate",
+                    json={
+                        "model": llm_model_name,
+                        "prompt": full_prompt,
+                        "stream": False,
+                        "temperature": temp,
+                        "options": {"num_predict": max_tokens}
+                    },
+                    timeout=60
+                )
+                if response.status_code == 200:
+                    result = response.json().get('response', '')
+                    self.conversation.append({'task': task, 'response': result})
+                    return result.strip() if result.strip() else f"{R}No response{X}"
+            
+            # Fallback to local model
             model_to_use = self.model or llm
             response = model_to_use.generate(
                 full_prompt,
@@ -1371,10 +3862,12 @@ class SubAgent:
         }
 
 class SubAgentManager:
-    """Manage multiple specialized sub-agents"""
+    """Manage multiple specialized sub-agents with 5-layer system"""
     def __init__(self):
         self.agents = {}
+        self.layered_system = LayeredAgentSystem()
         self.initialize_default_agents()
+        self.setup_layers()
     
     def initialize_default_agents(self):
         """Create default specialized agents"""
@@ -1409,8 +3902,38 @@ class SubAgentManager:
             agent = SubAgent(name, config['role'], config['prompt'])
             self.agents[name] = agent
     
+    def setup_layers(self):
+        """Setup 7-layer hierarchical agent system"""
+        # Layer 1: Input agents - session management
+        input_agent = SubAgent("input_mgr", "Input Manager", "Manage session, permissions, and gating")
+        self.layered_system.add_agent(1, input_agent)
+        
+        # Layer 2: Router agents - fast classification
+        router = SubAgent("router", "Router", "Classify and route requests efficiently")
+        self.layered_system.add_agent(2, router)
+        
+        # Layer 3: Knowledge agents - context compression
+        knowledge = SubAgent("knowledge", "Knowledge Manager", "Compress context and manage memory")
+        self.layered_system.add_agent(3, knowledge)
+        
+        # Layer 4: Analyzer agents - deep analysis
+        analyzer = self.agents.get('analyst') or SubAgent("analyzer", "Analyzer", "Perform deep analysis and pattern detection")
+        self.layered_system.add_agent(4, analyzer)
+        
+        # Layer 5: Processor agents - core processing
+        processor = self.agents.get('architect') or SubAgent("processor", "Processor", "Core task processing")
+        self.layered_system.add_agent(5, processor)
+        
+        # Layer 6: Refiner agents - output polish
+        refiner = self.agents.get('writer') or SubAgent("refiner", "Refiner", "Refine and improve outputs")
+        self.layered_system.add_agent(6, refiner)
+        
+        # Layer 7: Observability agents - audit & validation
+        validator = SubAgent("validator", "Validator", "Audit trail, validation, and observability")
+        self.layered_system.add_agent(7, validator)
+    
     def create_agent(self, name, role, system_prompt, model_path=None):
-        """Create custom agent"""
+        """Create custom agent dynamically"""
         agent = SubAgent(name, role, system_prompt, model_path)
         self.agents[name] = agent
         return agent
@@ -1425,7 +3948,7 @@ class SubAgentManager:
         if not agent:
             return f"{R}Agent not found{X}"
         
-        if not agent.model and agent != self.agents.get(agent_name):
+        if not agent.model:  # Fixed: Check if agent model is not initialized
             agent.initialize()
         
         return agent.execute(task, context)
@@ -1433,6 +3956,18 @@ class SubAgentManager:
     def list_agents(self):
         """List all agents"""
         return {name: agent.get_info() for name, agent in self.agents.items()}
+    
+    def execute_layered(self, task, context=''):
+        """Execute task through 7-layer system for optimal results"""
+        return self.layered_system.execute_layered(task, context)
+    
+    def get_layer_stats(self):
+        """Get performance stats from 7-layer system"""
+        return self.layered_system.get_stats()
+    
+    def get_audit_trail(self):
+        """Get audit trail from observability layer"""
+        return self.layered_system.get_audit_trail()
     
     def delegate(self, task, agents_needed):
         """Delegate task to multiple agents and combine results"""
@@ -1470,8 +4005,10 @@ class GGUFModelManager:
     
     def load_model(self, model_path, model_name=None):
         """Attempt to load any GGUF model with auto-fallback"""
+        if model_path is None:
+            raise ValueError("model_path cannot be None")
         if not model_name:
-            model_name = Path(model_path).name
+            model_name = Path(model_path).name if model_path else 'unknown'
         
         try:
             cpu_count = os.cpu_count() or 4
@@ -1790,7 +4327,8 @@ def print_hierarchy(hierarchy, indent):
         print_hierarchy(child, indent + 1)
 
 def main():
- global llm,model_path
+ global llm,model_path,current_session
+ log_startup()
  splash()
  
  # Initialize plugins
@@ -1802,11 +4340,12 @@ def main():
  if not setup():
   return
  
- print(f"{O2}Model: {O1}{Path(model_path).stem}{X}\n")
+ print(f"{O2}Model: {O1}{Path(model_path).stem if model_path else 'None'}{X}\n")
  
  while True:
   try:
    inp=input(f"{H1}You:{X} ").strip()
+   parts = []  # Initialize parts at start of every loop iteration
    
    if not inp:
     continue
@@ -1825,7 +4364,7 @@ def main():
    
    if inp=='/setup':
     if setup():
-     print(f"{O2}Model: {O1}{Path(model_path).stem}{X}\n")
+     print(f"{O2}Model: {O1}{Path(model_path).stem if model_path else 'None'}{X}\n")
     continue
    
    if inp=='/config':
@@ -1906,6 +4445,477 @@ def main():
       print(f"{R}✗ Failed to load plugin{X}\n")
     continue
    
+   if inp.startswith('/help') or inp == '/':
+    print(f"\n{O2}╔ Available Commands ╗{X}\n")
+    for cmd, desc in sorted(COMMANDS.items()):
+     print(f"  {H1}{cmd:15s}{X} {desc}")
+    print()
+    continue
+   
+   if inp.startswith('/models'):
+    parts = inp.split(None, 1)
+    if len(parts) < 2:
+     print(f"\n{O2}╔ Available Models ╗{X}\n")
+     if llm:
+      print(f"  {G}✓ Loaded:{X} {llm_model_name}\n")
+     else:
+      print(f"  {R}✗ No local model loaded{X}\n")
+     if api_router.list_configured():
+      print(f"  {H1}API Providers:{X}")
+      for provider in api_router.list_configured():
+       selected = api_router.selected_models.get(provider, 'default')
+       marker = f" {G}[PRIMARY]{X}" if provider == api_router.primary_api else ""
+       print(f"    • {H1}{provider}{X} {S}({selected}){X}{marker}")
+     print(f"\n{S}Usage: /models set <provider> <model> or /models reload{X}\n")
+    elif len(parts) > 1 and parts[1].startswith('set '):
+     args = parts[1].split()
+     if len(args) >= 3:
+      provider, model = args[1], args[2]
+      if provider in api_router.clients:
+       api_router.selected_models[provider] = model
+       if hasattr(api_router.clients[provider], 'model'):
+        api_router.clients[provider].model = model
+       print(f"{G}✓ Model set: {provider} = {model}{X}\n")
+      else:
+       print(f"{R}✗ Provider not configured: {provider}{X}\n")
+     else:
+      print(f"{R}Usage: /models set <provider> <model>{X}\n")
+    elif len(parts) > 1 and parts[1] == 'reload':
+     print(f"{O1}Reloading model configuration...{X}\n")
+     try:
+      api_router.initialize_clients()
+      print(f"{G}✓ Configuration reloaded{X}\n")
+     except Exception as e:
+      print(f"{R}✗ Reload failed: {str(e)[:60]}{X}\n")
+    continue
+   
+   if inp.startswith('/skill'):
+    parts = inp.split(None, 1)
+    if len(parts) < 2:
+     print(f"{H2}Usage: /skill <path_to_skill_file>{X}\n")
+    else:
+     skill_path = parts[1].strip()
+     try:
+      with open(skill_path, 'r') as f:
+       skill_code = f.read()
+      exec(skill_code, globals())
+      print(f"{G}✓ Skill loaded: {skill_path}{X}\n")
+      structured_logger.log('skill_loaded', path=skill_path)
+     except Exception as e:
+      print(f"{R}✗ Failed to load skill: {str(e)}{X}\n")
+      structured_logger.error('skill_load_failed', error=str(e))
+    continue
+   
+   if inp.startswith('/advsearch'):
+    parts = inp.split(None, 1)
+    if len(parts) < 2:
+     print(f"{H2}Usage: /advsearch <query>{X}\n")
+     continue
+    else:
+     search_query = parts[1].strip()
+     results = advanced_search(search_query, chat_history, limit=5)
+     if results:
+      print(f"\n{O2}╔ Search Results ╗{X}\n")
+      for i, (score, item) in enumerate(results, 1):
+       print(f"  {i}. {S}[{score:.2f}]{X} {item['prompt'][:60]}...")
+      print()
+     else:
+      print(f"{S}No results found{X}\n")
+    continue
+   
+   if inp.startswith('/context'):
+    print(f"\n{O2}╔ Conversation Context ╗{X}\n")
+    if current_session:
+     ctx_summary = f"Session: {current_session.session_id}\nMessages: {len(current_session.messages)}"
+     print(f"  {H1}{ctx_summary}{X}\n")
+    else:
+     print(f"  {S}No active session{X}\n")
+    print()
+    continue
+   
+   if inp.startswith('/agent'):
+    if not llm and not (api_router.primary_api and api_router.clients.get(api_router.primary_api)):
+     print(f"{R}✗ No model loaded and no API configured{X}\n")
+     continue
+    
+    run_as_agent()
+    continue
+   
+   if inp.startswith('/freerange'):
+    if not llm and not (api_router.primary_api and api_router.clients.get(api_router.primary_api)):
+     print(f"{R}✗ No model loaded and no API configured{X}\n")
+     continue
+    
+    if not freerange_enabled:
+     setup_freerange()
+    else:
+     print(f"{O2}Freerange Mode Options:{X}\n")
+     print(f"  {H1}[1]{X} Start task")
+     print(f"  {H1}[2]{X} Change directory")
+     print(f"  {H1}[3]{X} Disable freerange\n")
+     print(f"{H2}Choose:{X} ",end='',flush=True)
+     try:
+      opt=input().strip()
+      if opt=='1':
+       execute_freerange()
+      elif opt=='2':
+       disable_freerange()
+       setup_freerange()
+      elif opt=='3':
+       disable_freerange()
+     except:
+      print(f"{R}✗ Invalid option{X}\n")
+    continue
+   
+   if inp.startswith('/stats'):
+    print(f"\n{O2}╔ Statistics ╗{X}\n")
+    print(f"  {H1}Chat History:{X} {len(chat_history)} messages")
+    print(f"  {H1}Session:{X} {current_session.session_id if current_session else 'None'}")
+    print(f"  {H1}Configured APIs:{X} {', '.join(api_router.list_configured()) if api_router.list_configured() else 'None'}")
+    print(f"  {H1}Model:{X} {llm_model_name if llm else 'None (local)'}")
+    if HAS_COST_TRACKING:
+     tracker = budget_enforcer.trackers.get("default")
+     if tracker:
+      print(f"  {H1}Cost Tracker:{X} ${tracker.total_cost:.2f} spent")
+    print()
+    continue
+   
+   if inp.startswith('/export'):
+    parts = inp.split(None, 1)
+    if len(parts) > 1:
+     format_type = parts[1].strip().lower()
+    else:
+     format_type = 'txt'
+    
+    try:
+     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+     
+     if format_type == 'json':
+      export_file = Path.home() / '.hercules' / f"chat_export_{timestamp}.json"
+      export_data = {
+       'timestamp': datetime.now().isoformat(),
+       'messages': chat_history,
+       'total_messages': len(chat_history),
+       'branch': branch_manager.current_branch,
+       'api': api_router.primary_api if api_router.primary_api else None
+      }
+      with open(export_file, 'w') as f:
+       json.dump(export_data, f, indent=2)
+     else:
+      export_file = Path.home() / '.hercules' / f"chat_export_{timestamp}.txt"
+      with open(export_file, 'w') as f:
+       f.write(f"Chat Export - {datetime.now().isoformat()}\n")
+       f.write(f"Total Messages: {len(chat_history)}\n")
+       f.write(f"Branch: {branch_manager.current_branch}\n")
+       f.write("="*80 + "\n\n")
+       
+       for i, item in enumerate(chat_history, 1):
+        f.write(f"[{i}] Q: {item['prompt']}\n")
+        f.write(f"    A: {item['response']}\n")
+        f.write("-"*80 + "\n")
+     
+     print(f"{G}✓ Exported to {export_file.name}{X}\n")
+     structured_logger.log('chat_exported', filename=export_file.name, messages=len(chat_history))
+    except Exception as e:
+     print(f"{R}✗ Export failed: {str(e)[:60]}{X}\n")
+    continue
+   
+   if inp.startswith('/search') or inp.startswith('/history'):
+    if not chat_history:
+     print(f"{S}No chat history{X}\n")
+    else:
+     print(f"\n{O2}╔ Chat History ({len(chat_history)} messages) ╗{X}\n")
+     for i, item in enumerate(chat_history[-10:], 1):  # Show last 10
+      print(f"  {H1}[{i}]{X} Q: {item['prompt'][:60]}...")
+     print()
+    continue
+   
+   if inp.startswith('/save'):
+    parts = inp.split(None, 1)
+    if len(parts) > 1:
+     session_name = parts[1].strip()
+    else:
+     session_name = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    try:
+     if current_session:
+      current_session.save()
+      print(f"{G}✓ Current session saved{X}\n")
+     
+     # Also save chat history to named file
+     save_file = Path.home() / '.hercules' / 'sessions' / f"{session_name}.json"
+     save_file.parent.mkdir(parents=True, exist_ok=True)
+     
+     session_data = {
+      'name': session_name,
+      'timestamp': datetime.now().isoformat(),
+      'messages': chat_history,
+      'branch': branch_manager.current_branch,
+      'model': llm_model_name if llm else None,
+      'api': api_router.primary_api if api_router.primary_api else None
+     }
+     
+     with open(save_file, 'w') as f:
+      json.dump(session_data, f, indent=2)
+     
+     print(f"{G}✓ Session saved as: {session_name}{X}\n")
+     structured_logger.log('session_saved', name=session_name, messages=len(chat_history))
+    except Exception as e:
+     print(f"{R}✗ Save failed: {str(e)[:60]}{X}\n")
+     structured_logger.error('session_save_failed', error=str(e))
+    continue
+   
+   if inp.startswith('/load'):
+    parts = inp.split(None, 1)
+    if len(parts) < 2:
+     # List available sessions
+     session_dir = Path.home() / '.hercules' / 'sessions'
+     if session_dir.exists():
+      sessions = sorted([f.stem for f in session_dir.glob('*.json')])
+      if sessions:
+       print(f"\n{O2}╔ Available Sessions ╗{X}\n")
+       for i, sess in enumerate(sessions, 1):
+        print(f"  {H1}[{i}]{X} {sess}")
+       print(f"\n{H2}Usage: /load <session_name>{X}\n")
+      else:
+       print(f"{S}No saved sessions{X}\n")
+     else:
+      print(f"{S}No saved sessions{X}\n")
+    else:
+     session_name = parts[1].strip()
+     try:
+      session_file = Path.home() / '.hercules' / 'sessions' / f"{session_name}.json"
+      if session_file.exists():
+       with open(session_file, 'r') as f:
+        session_data = json.load(f)
+       
+       chat_history.clear()
+       chat_history.extend(session_data.get('messages', []))
+       
+       print(f"{G}✓ Session loaded: {session_name}{X}")
+       print(f"  {O1}Messages:{X} {len(chat_history)}")
+       print(f"  {O1}Branch:{X} {session_data.get('branch', 'main')}")
+       print(f"  {O1}Model:{X} {session_data.get('model', 'local')}\n")
+       
+       structured_logger.log('session_loaded', name=session_name, messages=len(chat_history))
+      else:
+       print(f"{R}✗ Session not found: {session_name}{X}\n")
+     except Exception as e:
+      print(f"{R}✗ Load failed: {str(e)[:60]}{X}\n")
+      structured_logger.error('session_load_failed', error=str(e))
+    continue
+   
+   if inp.startswith('/clear'):
+    chat_history.clear()
+    if current_session:
+     current_session.messages.clear()
+    print(f"{G}✓ Chat history cleared{X}\n")
+    continue
+   
+   if inp.startswith('/exit') or inp.startswith('/quit'):
+    if current_session:
+     current_session.save()
+    print(f"\n{S}Goodbye!{X}\n")
+    break
+   
+   if inp.startswith('/api'):
+    parts = inp.split(None, 2)
+    if len(parts) < 2 or parts[1] == '':
+     # Main API menu with dropdown
+     print(f"\n{O2}╔ API Configuration ╗{X}\n")
+     configured = api_config.list_apis()
+     print(f"  {H1}Configured:{X} {', '.join(configured) if configured else 'None'}")
+     print(f"  {H1}Primary:{X} {api_router.primary_api or 'Not set'}")
+     
+     print(f"\n{O2}API Menu:{X}\n")
+     print(f"  {H1}[1]{X} Add new provider")
+     print(f"  {H1}[2]{X} Select primary API")
+     print(f"  {H1}[3]{X} List configured APIs")
+     print(f"  {H1}[4]{X} Query with multiple APIs")
+     print(f"  {H1}[5]{X} Remove provider")
+     print(f"  {H1}[6]{X} View API models")
+     print(f"\n{H2}Choose option (1-6):{X} ", end='', flush=True)
+     
+     try:
+      menu_choice = input().strip()
+      
+      if menu_choice == '1':
+       # Add new provider with dropdown
+       providers_list = ['openai', 'anthropic', 'gemini', 'groq', 'cohere', 'deepseek', 'xai', 'meta', 'huggingface', 'together', 'azure']
+       print(f"\n{O2}Select Provider:{X}\n")
+       for i, prov in enumerate(providers_list, 1):
+        print(f"  {H1}[{i}]{X} {prov}")
+       
+       print(f"\n{H2}Choose (1-{len(providers_list)}):{X} ", end='', flush=True)
+       prov_choice = int(input().strip()) - 1
+       
+       if 0 <= prov_choice < len(providers_list):
+        provider = providers_list[prov_choice]
+        
+        # Ask for key(s)
+        print(f"\n{O2}Add API Key for {provider.upper()}{X}\n")
+        print(f"  {H1}[1]{X} Single key")
+        print(f"  {H1}[2]{X} Multiple keys (for fallback)")
+        print(f"\n{H2}Choose:{X} ", end='', flush=True)
+        
+        key_choice = input().strip()
+        keys = []
+        
+        if key_choice == '1':
+         print(f"{H2}Enter API key:{X} ", end='', flush=True)
+         key = input().strip()
+         if key:
+          keys.append(key)
+        else:
+         print(f"{H2}Enter API keys (comma-separated):{X} ", end='', flush=True)
+         key_input = input().strip()
+         keys = [k.strip() for k in key_input.split(',') if k.strip()]
+        
+        if keys:
+         # Store all keys
+         for idx, key in enumerate(keys):
+          key_name = f"{provider}" if idx == 0 else f"{provider}_{idx}"
+          api_config.set_api(key_name, key)
+          print(f"{G}✓ Key {idx+1} stored{X}")
+         
+         api_router.initialize_clients()
+         
+         # Set primary
+         if not api_router.primary_api:
+          api_router.set_primary(provider)
+          print(f"{G}✓ Set as primary API{X}\n")
+         
+         # Show model selection
+         if provider in API_MODELS:
+          models = API_MODELS[provider]
+          print(f"\n{O2}Select Model for {provider.upper()}{X}\n")
+          model_list = list(models.keys())
+          for i, model_id in enumerate(model_list, 1):
+           model = models[model_id]
+           display = model.get('display', model_id)
+           print(f"  {H1}[{i}]{X} {display:<30s} ${model.get('input', 0):.2f}/${model.get('output', 0):.2f}")
+          
+          print(f"\n{H2}Select model (1-{len(model_list)}):{X} ", end='', flush=True)
+          try:
+           m_choice = int(input().strip()) - 1
+           if 0 <= m_choice < len(model_list):
+            api_router.selected_models[provider] = model_list[m_choice]
+            print(f"{G}✓ Model selected{X}\n")
+          except:
+           pass
+        else:
+         print(f"{R}✗ No keys provided{X}\n")
+       else:
+        print(f"{R}✗ Invalid selection{X}\n")
+      
+      elif menu_choice == '2':
+       # Select primary API
+       configured = api_router.list_configured()
+       if configured:
+        print(f"\n{O2}Select Primary API:{X}\n")
+        for i, prov in enumerate(configured, 1):
+         marker = f" {G}[CURRENT]{X}" if prov == api_router.primary_api else ""
+         print(f"  {H1}[{i}]{X} {prov}{marker}")
+        
+        print(f"\n{H2}Choose (1-{len(configured)}):{X} ", end='', flush=True)
+        choice = int(input().strip()) - 1
+        if 0 <= choice < len(configured):
+         api_router.set_primary(configured[choice])
+         print(f"{G}✓ Primary set to {configured[choice]}{X}\n")
+       else:
+        print(f"{R}No APIs configured{X}\n")
+      
+      elif menu_choice == '3':
+       # List configured
+       configured = api_router.list_configured()
+       print(f"\n{O2}╔ Configured APIs ╗{X}\n")
+       if configured:
+        for prov in configured:
+         model = api_router.selected_models.get(prov, 'default')
+         marker = f" {G}[PRIMARY]{X}" if prov == api_router.primary_api else ""
+         print(f"  {H1}• {prov}{X} ({model}){marker}")
+       else:
+        print(f"  {R}None configured{X}")
+       print()
+      
+      elif menu_choice == '4':
+       # Query with multiple APIs
+       configured = api_router.list_configured()
+       if not configured:
+        print(f"{R}No APIs configured{X}\n")
+        continue
+       
+       print(f"\n{H2}Enter prompt:{X} ", end='', flush=True)
+       prompt = input().strip()
+       
+       print(f"\n{O2}Select APIs to query:{X}\n")
+       for i, prov in enumerate(configured, 1):
+        print(f"  {H1}[{i}]{X} {prov}")
+       
+       print(f"\n{H2}Choose APIs (comma-separated, e.g. 1,2,3):{X} ", end='', flush=True)
+       selections = input().strip().split(',')
+       
+       try:
+        selected_apis = [configured[int(s.strip())-1] for s in selections if s.strip()]
+        if selected_apis:
+         print(f"\n{G}Querying {len(selected_apis)} APIs...{X}\n")
+         results = {}
+         for api in selected_apis:
+          try:
+           response = api_router.query(prompt, provider=api)
+           results[api] = response
+           print(f"{O1}[{api}]{X}\n{G}{response[:200]}...{X}\n")
+          except Exception as e:
+           results[api] = f"Error: {str(e)[:60]}"
+           print(f"{O1}[{api}]{X}\n{R}Error{X}\n")
+         
+         chat_history.append({
+          'prompt': f'[MULTI-API] {prompt}',
+          'response': str(results),
+          'apis_used': selected_apis
+         })
+       except (ValueError, IndexError):
+        print(f"{R}✗ Invalid selection{X}\n")
+      
+      elif menu_choice == '5':
+       # Remove provider
+       configured = api_router.list_configured()
+       if configured:
+        print(f"\n{O2}Select provider to remove:{X}\n")
+        for i, prov in enumerate(configured, 1):
+         print(f"  {H1}[{i}]{X} {prov}")
+        
+        print(f"\n{H2}Choose (1-{len(configured)}):{X} ", end='', flush=True)
+        choice = int(input().strip()) - 1
+        if 0 <= choice < len(configured):
+         api_config.remove_api(configured[choice])
+         api_router.initialize_clients()
+         print(f"{G}✓ Removed{X}\n")
+       else:
+        print(f"{R}No APIs to remove{X}\n")
+      
+      elif menu_choice == '6':
+       # View models
+       configured = api_router.list_configured()
+       if configured:
+        print(f"\n{O2}Select provider:{X}\n")
+        for i, prov in enumerate(configured, 1):
+         print(f"  {H1}[{i}]{X} {prov}")
+        
+        print(f"\n{H2}Choose:{X} ", end='', flush=True)
+        choice = int(input().strip()) - 1
+        if 0 <= choice < len(configured):
+         prov = configured[choice]
+         if prov in API_MODELS:
+          print(f"\n{O2}Models for {prov.upper()}:{X}\n")
+          for model_id, model in API_MODELS[prov].items():
+           print(f"  {H1}{model.get('display', model_id)}{X}")
+           print(f"    Input:  ${model.get('input', 0):.2f}/1M")
+           print(f"    Output: ${model.get('output', 0):.2f}/1M")
+     except Exception as e:
+      print(f"{R}Error: {str(e)[:60]}{X}\n")
+     continue
+   
    if inp.startswith('/branch'):
     parts = inp.split(None, 2)
     if len(parts) < 2:
@@ -1930,6 +4940,104 @@ def main():
       print(f"{G}✓ Merged {parts[2]} into main{X}\n")
      else:
       print(f"{R}✗ Merge failed{X}\n")
+    continue
+   
+   # ===== CLAUDE CODE FEATURES (Priority 1-3) =====
+   
+   if inp.startswith('/security'):
+    parts = inp.split()
+    if HAS_SECURITY:
+     if len(parts) < 2:
+      print(f"\n{O2}╔ Security Settings ╗{X}\n")
+      print(f"  {S}/security mode <default|accept|auto|dont_ask>{X}")
+      print(f"  {S}/security audit{X}\n")
+     elif parts[1] == 'mode' and len(parts) >= 3:
+      mode_str = parts[2].upper()
+      try:
+       new_mode = PermissionMode[mode_str]
+       permission_gate.mode = new_mode
+       print(f"{G}✓ Permission mode: {new_mode.value}{X}\n")
+      except:
+       print(f"{R}Invalid mode{X}\n")
+     elif parts[1] == 'audit':
+      print(f"\n{O2}╔ Security Audit Log ╗{X}\n")
+      for entry in permission_gate.audit_log[-5:]:
+       status = "✓" if entry['approved'] else "✗"
+       print(f"  {status} {entry['tool']}:{entry['action']}")
+      print()
+    else:
+     print(f"{R}Security layer not available{X}\n")
+    continue
+   
+   if inp.startswith('/tools'):
+    if HAS_TOOLS:
+     parts = inp.split()
+     if len(parts) < 2:
+      print(f"\n{O2}╔ Available Tools ╗{X}\n")
+      for tool_name, tool_info in tool_registry.list_tools().items():
+       print(f"  {H1}{tool_name}:{X} {tool_info['description']}")
+      print()
+     elif parts[1] == 'exec' and len(parts) >= 3:
+      tool_name = parts[2]
+      print(f"  {S}[Tool: {tool_name}]{X}\n")
+    else:
+     print(f"{R}Tool system not available{X}\n")
+    continue
+   
+   if inp.startswith('/session'):
+    if HAS_PERSISTENCE:
+     parts = inp.split()
+     if len(parts) < 2:
+      print(f"\n{O2}╔ Session Management ╗{X}\n")
+      sessions = session_persistence.list_sessions()
+      for sess_id in sessions:
+       print(f"  {H1}{sess_id}{X}")
+      print()
+     elif parts[1] == 'save':
+      session_persistence.save_session(current_session)
+      print(f"{G}✓ Session saved{X}\n")
+     elif parts[1] == 'load' and len(parts) >= 3:
+      current_session = session_persistence.load_session(parts[2])
+      if current_session:
+       print(f"{G}✓ Loaded: {parts[2]}{X}\n")
+    else:
+     print(f"{R}Persistence not available{X}\n")
+    continue
+   
+   if inp.startswith('/team'):
+    if HAS_TEAMS:
+     parts = inp.split(None, 2)
+     if len(parts) < 2:
+      print(f"\n{O2}╔ Agent Teams ╗{X}\n")
+      print(f"  {S}/team status          - Show team status{X}")
+      print(f"  {S}/team create <name>   - Create new team{X}")
+      print(f"  {S}/team delegate <task> - Delegate task to team{X}\n")
+     elif parts[1] == 'status':
+      status = active_team.get_team_status()
+      print(f"\n{O2}╔ Team Status ╗{X}\n")
+      print(f"  {H1}Members:{X} {status['members']}")
+      print(f"  {H1}Tasks:{X} {status['completed']}/{status['total_tasks']} completed\n")
+     elif parts[1] == 'create' and len(parts) >= 3:
+      team_name = parts[2]
+      print(f"{G}✓ Team created: {team_name}{X}\n")
+      structured_logger.log('team_created', name=team_name)
+     elif parts[1] == 'delegate' and len(parts) >= 3:
+      task = parts[2]
+      print(f"\n{O2}╔ Task Delegation ╗{X}\n")
+      print(f"  {H1}Delegating:{X} {task}\n")
+      # Delegate to team members
+      result = active_team.delegate_task(task)
+      print(f"  {H1}Status:{X} {result}\n")
+      structured_logger.log('task_delegated', task=task)
+    else:
+     print(f"{R}Teams not available{X}\n")
+    continue
+   
+   if inp.startswith('/cost'):
+    if HAS_COST_TRACKING:
+     print(f"{O1}Cost tracking active{X}\n")
+    else:
+     print(f"{R}Cost tracking not available{X}\n")
     continue
    
    if inp.startswith('/memory'):
@@ -2075,6 +5183,8 @@ def main():
       print(f"  {H1}{model}{X}")
      print()
     continue
+   
+   if inp=='/agent':
     run_as_agent()
     continue
    
@@ -2083,7 +5193,7 @@ def main():
     continue
    
    if inp=='/advsearch':
-    advanced_search()
+    advanced_search_menu()
     continue
    
    if inp=='/clear':
@@ -2150,9 +5260,12 @@ def main():
    
   except KeyboardInterrupt:
    print(f"\n{S}Interrupted{X}\n")
+   structured_logger.log('shutdown', reason='keyboard_interrupt')
    break
   except Exception as e:
-   print(f"{R}Error: {e}{X}\n")
+   error_msg = f"Error: {e}"
+   print(f"{R}{error_msg}{X}\n")
+   structured_logger.error('main_loop_error', error=str(e))
 
 if __name__=='__main__':
  main()

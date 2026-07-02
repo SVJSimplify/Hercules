@@ -38,6 +38,66 @@ from pathlib import Path
 from collections import Counter
 from datetime import datetime
 
+# OS-SPECIFIC COMMAND EXECUTOR
+class OSCommandExecutor:
+    """Execute commands with correct shell for OS"""
+    def __init__(self):
+        self.os_type = platform.system()
+        self.is_windows = self.os_type == 'Windows'
+        self.shell = 'powershell.exe' if self.is_windows else '/bin/bash'
+    
+    def write_file(self, filepath: str, content: str) -> tuple:
+        """Write file cross-platform"""
+        try:
+            if self.is_windows:
+                cmd = f'@"\n{content}\n"@ | Out-File -Encoding UTF8 -FilePath "{filepath}"'
+                result = subprocess.run(['powershell.exe', '-Command', cmd], capture_output=True, text=True, timeout=5)
+            else:
+                cmd = f"cat > '{filepath}' << 'HEREDOC'\n{content}\nHEREDOC"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+            return result.returncode == 0, result.stderr or "File written"
+        except Exception as e:
+            return False, str(e)
+    
+    def verify_file(self, filepath: str) -> tuple:
+        """Verify file exists and get content"""
+        try:
+            if self.is_windows:
+                cmd = f'Get-Content -Path "{filepath}"'
+                result = subprocess.run(['powershell.exe', '-Command', cmd], capture_output=True, text=True, timeout=5)
+            else:
+                result = subprocess.run(f"cat '{filepath}'", shell=True, capture_output=True, text=True, timeout=5)
+            return result.returncode == 0, result.stdout or result.stderr
+        except Exception as e:
+            return False, str(e)
+    
+    def list_files(self, directory: str) -> tuple:
+        """List directory contents"""
+        try:
+            if self.is_windows:
+                cmd = f'Get-ChildItem -Path "{directory}"'
+                result = subprocess.run(['powershell.exe', '-Command', cmd], capture_output=True, text=True, timeout=5)
+            else:
+                result = subprocess.run(f"ls -la '{directory}'", shell=True, capture_output=True, text=True, timeout=5)
+            return result.returncode == 0, result.stdout or result.stderr
+        except Exception as e:
+            return False, str(e)
+    
+    def run_command(self, cmd: str) -> tuple:
+        """Execute arbitrary command"""
+        try:
+            if self.is_windows:
+                result = subprocess.run(['powershell.exe', '-Command', cmd], capture_output=True, text=True, timeout=10)
+            else:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            return result.returncode == 0, result.stdout + result.stderr
+        except subprocess.TimeoutExpired:
+            return False, "Command timeout"
+        except Exception as e:
+            return False, str(e)
+
+os_executor = OSCommandExecutor()
+
 try:
     from colorama import init
     import subprocess
@@ -88,6 +148,29 @@ def log_startup():
     logger.info(f"Python: {sys.version}")
 
 atexit.register(lambda: logger.info("Hercules shutdown"))
+
+class FilePermissionManager:
+    """Manage file operation permissions"""
+    def __init__(self):
+        self.deletion_whitelist = set()
+    
+    def request_deletion_permission(self, filepath: str, op_type: str = "delete") -> bool:
+        """Ask user for operation permission"""
+        print(f"\n{O1}⚠️  {op_type.capitalize()} permission required{X}")
+        if filepath and filepath != 'unspecified':
+            print(f"{S}Target: {filepath}{X}")
+        print(f"{H2}Confirm {op_type}? (yes/no): {X}", end='', flush=True)
+        resp = input().strip().lower()
+        if resp == 'yes':
+            self.deletion_whitelist.add(filepath)
+            return True
+        return False
+    
+    def is_safe_to_delete(self, filepath: str) -> bool:
+        """Check if file can be deleted"""
+        return filepath in self.deletion_whitelist
+
+file_perms = FilePermissionManager()
 
 class StructuredLogger:
     """JSON-structured logging"""
@@ -1075,7 +1158,13 @@ class FileEditTool(Tool):
     
     def execute(self, path: str, content: str, mode: str = 'w', **params):
         try:
+            # ENHANCEMENT: Strip quotes from path in case they slipped through
+            path = _strip_quotes(path) if path else path
+            
             p = Path(path)
+            # Auto-create parent directories if they don't exist
+            p.parent.mkdir(parents=True, exist_ok=True)
+            
             if mode == 'w':
                 p.write_text(content)
             elif mode == 'a':
@@ -1092,8 +1181,27 @@ class FileReadTool(Tool):
     
     def execute(self, path: str, **params):
         try:
+            # ENHANCEMENT: Strip quotes from path
+            path = _strip_quotes(path) if path else path
+            
             content = Path(path).read_text()
             return {"success": True, "content": content, "size": len(content)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+class MkdirTool(Tool):
+    """Create directories"""
+    def __init__(self):
+        super().__init__("mkdir", "Create directories", {"path": "str", "parents": "bool"})
+    
+    def execute(self, path: str, parents: bool = True, **params):
+        try:
+            # ENHANCEMENT: Strip quotes from path
+            path = _strip_quotes(path) if path else path
+            
+            p = Path(path)
+            p.mkdir(parents=parents, exist_ok=True)
+            return {"success": True, "path": str(p), "created": True}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -1116,6 +1224,64 @@ class BashTool(Tool):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+class TodoWriteTool(Tool):
+    """NEW: Write/create persistent todo items"""
+    def __init__(self):
+        super().__init__("todo_write", "Create a persistent todo item", {"content": "str", "priority": "str", "todo_id": "str"})
+    
+    def execute(self, content: str, priority: str = "normal", todo_id: str = None, **params):
+        todo_file = Path.home() / '.hercules' / 'todos.jsonl'
+        todo_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            import uuid
+            from datetime import datetime
+            
+            todo_id = todo_id or str(uuid.uuid4())[:8]
+            todo_entry = {
+                'id': todo_id,
+                'content': content,
+                'priority': priority,
+                'created': datetime.now().isoformat(),
+                'completed': False
+            }
+            
+            with open(todo_file, 'a') as f:
+                f.write(json.dumps(todo_entry) + '\n')
+            
+            structured_logger.log('todo_written', todo_id=todo_id, priority=priority)
+            return {"success": True, "message": f"Todo '{todo_id}' created", "todo_id": todo_id}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+class TodoReadTool(Tool):
+    """NEW: Read/retrieve persistent todo items"""
+    def __init__(self):
+        super().__init__("todo_read", "Read todo items", {"todo_id": "str", "status": "str"})
+    
+    def execute(self, todo_id: str = None, status: str = "all", **params):
+        todo_file = Path.home() / '.hercules' / 'todos.jsonl'
+        try:
+            if not todo_file.exists():
+                return {"success": True, "todos": [], "message": "No todos yet"}
+            
+            todos = []
+            with open(todo_file, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        todo = json.loads(line)
+                        if todo_id and todo['id'] != todo_id:
+                            continue
+                        if status == 'completed' and not todo['completed']:
+                            continue
+                        if status == 'pending' and todo['completed']:
+                            continue
+                        todos.append(todo)
+            
+            structured_logger.log('todo_read', count=len(todos), filter=status)
+            return {"success": True, "todos": todos, "count": len(todos)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
 class ToolRegistry:
     """18-tool system"""
     def __init__(self):
@@ -1125,7 +1291,14 @@ class ToolRegistry:
     def _register_builtin_tools(self):
         self.register(FileReadTool())
         self.register(FileEditTool())
+        self.register(MkdirTool())  # NEW: mkdir tool
         self.register(BashTool())
+        self.register(TodoWriteTool())  # NEW: TodoWrite tool
+        self.register(TodoReadTool())    # NEW: TodoRead tool
+        
+        # Register aliases for convenience
+        file_edit_tool = self.tools['file_edit']
+        self.tools['file_write'] = file_edit_tool  # Alias: file_write -> file_edit
     
     def register(self, tool: Tool):
         self.tools[tool.name] = tool
@@ -1365,9 +1538,30 @@ class AgentTeam:
         return member
     
     async def delegate_task(self, title: str, description: str, assigned_to: str = None):
+        """ENHANCEMENT: Now ACTUALLY EXECUTES delegated agents instead of just queuing"""
         self.task_counter += 1
-        self.tasks.append({'id': f"task_{self.task_counter}", 'title': title, 'status': 'pending'})
-        return f"task_{self.task_counter}"
+        task_id = f"task_{self.task_counter}"
+        task = {'id': task_id, 'title': title, 'description': description, 'status': 'running', 'assigned_to': assigned_to, 'result': None}
+        self.tasks.append(task)
+        
+        try:
+            # Execute delegated agent if specified
+            if assigned_to and assigned_to in agent_manager.agents:
+                agent = agent_manager.agents[assigned_to]
+                if not agent.model:
+                    agent.initialize()
+                result = agent.execute(description)
+                task['result'] = result
+                task['status'] = 'complete'
+                structured_logger.log('task_delegated_executed', task_id=task_id, agent=assigned_to)
+            else:
+                task['status'] = 'pending'
+        except Exception as e:
+            task['status'] = 'failed'
+            task['result'] = str(e)
+            structured_logger.error('task_delegation_failed', task_id=task_id, error=str(e))
+        
+        return task_id
     
     def get_team_status(self):
         return {
@@ -1639,15 +1833,56 @@ layout_engine = LayoutEngine()
 # === CLAUDE CODE CORE: ReAct LOOP ===
 
 class ReActLoop:
-    """Claude Code's core ReAct pattern: Reasoning + Action + Feedback"""
+    """Claude Code's core ReAct pattern: Reasoning + Action + Feedback with MULTI-CYCLE support"""
     def __init__(self):
         self.max_iterations = 10
         self.messages = []
         self.thoughts = []
         self.actions = []
+        self.cycles_executed = 0
+    
+    def run_full_loop(self, prompt: str, query_func, max_cycles: int = 5) -> dict:
+        """ENHANCEMENT: Run MULTIPLE Thought -> Action -> Observation cycles (not just one)"""
+        self.cycles_executed = 0
+        final_response = ""
+        observations = []
+        all_actions = []
+        
+        for cycle in range(max_cycles):
+            cycle_prompt = prompt if cycle == 0 else f"{prompt}\n\nContext from previous cycles:\n" + "\n".join(observations[-3:])
+            model_response = query_func(cycle_prompt)
+            
+            if not model_response:
+                break
+            
+            thought = self._extract_thought(model_response)
+            self.thoughts.append(thought)
+            
+            action_result = None
+            if '<action>' in model_response or '<tool_call>' in model_response:
+                action = self._extract_action(model_response)
+                action_result = self._execute_action(action)
+                all_actions.append({'cycle': cycle, 'action': action, 'result': action_result})
+                observation = f"[Cycle {cycle} Result]: {action_result}"
+            else:
+                observation = f"[Cycle {cycle} Complete]: No further action needed"
+                final_response = model_response
+                self.cycles_executed = cycle + 1
+                break
+            
+            observations.append(observation)
+            self.cycles_executed = cycle + 1
+        
+        return {
+            'cycles': self.cycles_executed,
+            'thoughts': self.thoughts[-self.cycles_executed:],
+            'actions': all_actions,
+            'observations': observations,
+            'final_response': final_response
+        }
     
     def step(self, prompt: str, model_response: str) -> dict:
-        """One ReAct iteration: think -> act -> observe"""
+        """Single ReAct iteration: think -> act -> observe (legacy compatibility)"""
         
         # 1. REASONING: Extract thinking from model
         thought = self._extract_thought(model_response)
@@ -1682,6 +1917,10 @@ class ReActLoop:
         if '<action>' in response:
             start = response.find('<action>') + 8
             end = response.find('</action>')
+            return response[start:end]
+        elif '<tool_call>' in response:
+            start = response.find('<tool_call>') + 11
+            end = response.find('</tool_call>')
             return response[start:end]
         return ""
     
@@ -1830,6 +2069,7 @@ COMMANDS = {
     '/advsearch': 'Advanced search with ranking',
     '/context': 'Show conversation context',
     '/agent': 'Run as autonomous agent',
+    '/errorlog': 'Toggle agent debug/error output (default: OFF)',
     '/freerange': 'Enter unrestricted mode (file/bash access)',
     '/stats': 'Show system statistics',
     '/cost': 'Show cost tracking',
@@ -2661,39 +2901,725 @@ def list_skills():
         print(f"      {S}{skill}{X}\n")
 
 
+def _strip_quotes(value: str) -> str:
+    """Strip surrounding quotes from string values"""
+    if not value:
+        return value
+    # Remove surrounding single or double quotes
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        return value[1:-1]
+    return value
+
+# Global debug mode flag
+agent_debug_mode = False
+
+class AgentCodeExecutor:
+    """Agent with Claude Code capabilities - patterns, templates, tools"""
+    def __init__(self):
+        self.claude_patterns = {
+            'mcp_integration': 'Model Context Protocol for tool integration',
+            'artifact_creation': 'Standalone code artifacts with create_file',
+            'agentic_workflow': 'Multi-turn reasoning with tool use',
+            'structured_output': 'JSON responses for UI rendering',
+            'context_window': 'Track conversation state across turns',
+            'streaming': 'Progressive token generation',
+            'vision': 'Image understanding and analysis',
+            'web_search': 'Real-time information retrieval',
+            'file_ops': 'Read/write/modify file operations',
+            'bash_execution': 'Terminal command execution with safety',
+            'error_recovery': 'Smart fallback strategies',
+            'planning': 'Multi-step task decomposition',
+            'verification': 'Confirm success with reads/checks'
+        }
+        
+        self.code_templates = {
+            'file_write': 'os_executor.write_file(path, content)',
+            'file_read': 'os_executor.verify_file(path)',
+            'file_list': 'os_executor.list_files(directory)',
+            'bash_cmd': 'os_executor.run_command(cmd)',
+            'json_parse': 'import json; data = json.loads(content)',
+            'csv_ops': 'import csv; reader = csv.DictReader(f)',
+            'regex_match': 'import re; match = re.search(pattern, text)',
+            'data_transform': 'list comprehension or pandas for data ops',
+            'api_call': 'requests.get(url, headers=headers)',
+            'error_handle': 'try/except with specific error types'
+        }
+        
+        # PERMISSION MATRIX: True = needs permission, False = silent
+        self.agent_tools = {
+            # File operations (no permission needed for create/edit)
+            'file_write': {'desc': 'Create/write files with content', 'needs_permission': False},
+            'file_read': {'desc': 'Read and verify file contents', 'needs_permission': False},
+            'file_edit': {'desc': 'Edit specific parts of files', 'needs_permission': False},
+            'file_list': {'desc': 'List directory contents', 'needs_permission': False},
+            'file_delete': {'desc': 'Delete files (permission required)', 'needs_permission': True},
+            'mkdir': {'desc': 'Create directories', 'needs_permission': False},
+            
+            # Execution (no permission needed - user asked for it)
+            'bash_cmd': {'desc': 'Execute shell commands', 'needs_permission': False},
+            'bash_read': {'desc': 'Read files via shell', 'needs_permission': False},
+            'bash_write': {'desc': 'Write files via shell', 'needs_permission': False},
+            
+            # Data operations (no permission needed - transformative)
+            'json_parse': {'desc': 'Parse and validate JSON', 'needs_permission': False},
+            'csv_read': {'desc': 'Read CSV files', 'needs_permission': False},
+            'csv_write': {'desc': 'Write CSV files', 'needs_permission': False},
+            'regex_search': {'desc': 'Find patterns in text', 'needs_permission': False},
+            'data_transform': {'desc': 'Transform/reshape data', 'needs_permission': False},
+            
+            # Web operations (no permission needed - read-only)
+            'web_fetch': {'desc': 'Download web pages', 'needs_permission': False},
+            'web_search': {'desc': 'Search information', 'needs_permission': False},
+            
+            # API calls (no permission needed)
+            'api_call': {'desc': 'Call REST APIs', 'needs_permission': False},
+            
+            # Git operations (needs permission for destructive ops)
+            'git_clone': {'desc': 'Clone repositories', 'needs_permission': False},
+            'git_commit': {'desc': 'Commit changes', 'needs_permission': False},
+            'git_push': {'desc': 'Push to remote (needs permission)', 'needs_permission': True},
+            'git_reset': {'desc': 'Reset commits (needs permission)', 'needs_permission': True},
+            
+            # Code operations (no permission needed)
+            'code_format': {'desc': 'Format code (black, prettier)', 'needs_permission': False},
+            'code_lint': {'desc': 'Check code quality', 'needs_permission': False},
+            'unit_test': {'desc': 'Run tests', 'needs_permission': False},
+            'profiling': {'desc': 'Profile code performance', 'needs_permission': False},
+            
+            # Config operations (no permission for read, yes for write destructive)
+            'env_vars': {'desc': 'Manage environment variables', 'needs_permission': False},
+            'config_parse': {'desc': 'Parse config files', 'needs_permission': False},
+            'config_write': {'desc': 'Modify config files', 'needs_permission': False},
+            
+            # Database operations (needs permission for write/delete)
+            'db_query': {'desc': 'Execute database queries', 'needs_permission': False},
+            'db_insert': {'desc': 'Insert database records', 'needs_permission': True},
+            'db_update': {'desc': 'Update database records', 'needs_permission': True},
+            'db_delete': {'desc': 'Delete database records (needs permission)', 'needs_permission': True},
+            
+            # File processing (no permission needed)
+            'image_process': {'desc': 'Image manipulation', 'needs_permission': False},
+            'pdf_process': {'desc': 'PDF reading/writing', 'needs_permission': False},
+            'archive_extract': {'desc': 'Extract zip/tar files', 'needs_permission': False},
+        }
+    
+    def needs_permission(self, tool_name: str) -> bool:
+        """Check if tool needs user permission"""
+        return self.agent_tools.get(tool_name, {}).get('needs_permission', False)
+    
+    def suggest_claude_pattern(self, task):
+        """Suggest Claude Code pattern for task"""
+        task_lower = task.lower()
+        suggestions = []
+        
+        if any(x in task_lower for x in ['create', 'write', 'file']):
+            suggestions.append('artifact_creation')
+        if any(x in task_lower for x in ['multi-step', 'loop', 'iterate']):
+            suggestions.append('agentic_workflow')
+        if any(x in task_lower for x in ['json', 'data', 'structure']):
+            suggestions.append('structured_output')
+        if any(x in task_lower for x in ['image', 'vision', 'analyze']):
+            suggestions.append('vision')
+        if any(x in task_lower for x in ['search', 'web', 'fetch']):
+            suggestions.append('web_search')
+        if any(x in task_lower for x in ['error', 'fail', 'recover']):
+            suggestions.append('error_recovery')
+        if any(x in task_lower for x in ['bash', 'shell', 'command']):
+            suggestions.append('bash_execution')
+        
+        return suggestions if suggestions else ['agentic_workflow']
+    
+    def get_template(self, template_name):
+        """Get code template"""
+        return self.code_templates.get(template_name, f"Template {template_name} not found")
+    
+    def get_tool_description(self, tool_name):
+        """Get tool description with permission status"""
+        tool_info = self.agent_tools.get(tool_name)
+        if not tool_info:
+            return f"Tool {tool_name} not found"
+        desc = tool_info['desc']
+        perm_marker = " 🔒" if tool_info['needs_permission'] else ""
+        return desc + perm_marker
+    
+    def list_all_tools(self):
+        """List all available tools"""
+        return list(self.agent_tools.keys())
+
+agent_executor = AgentCodeExecutor()
+
+class AgentDecisionEngine:
+    """Advanced agent reasoning with planning & memory"""
+    def __init__(self):
+        self.tools = {}
+        self.tool_history = []
+        self.task_memory = {}
+        self.execution_plans = {}
+        self.confidence_threshold = 0.7
+        self.max_retries = 3
+    
+    def register_tool(self, name: str, func, description: str):
+        """Register a tool for agent use"""
+        self.tools[name] = {'func': func, 'desc': description, 'success_count': 0, 'fail_count': 0}
+        structured_logger.log('tool_registered', tool=name)
+    
+    def analyze_task(self, task: str) -> dict:
+        """Decompose task into subtasks"""
+        subtasks = []
+        task_lower = task.lower()
+        
+        # Detect task type
+        if 'create' in task_lower or 'write' in task_lower:
+            subtasks.append('verify_path')
+            subtasks.append('write_file')
+            subtasks.append('verify_content')
+        elif 'edit' in task_lower or 'modify' in task_lower:
+            subtasks.append('verify_exists')
+            subtasks.append('read_content')
+            subtasks.append('edit_file')
+            subtasks.append('verify_changes')
+        elif 'delete' in task_lower or 'remove' in task_lower:
+            subtasks.append('verify_exists')
+            subtasks.append('request_permission')
+            subtasks.append('delete_item')
+            subtasks.append('verify_deleted')
+        elif 'list' in task_lower or 'find' in task_lower or 'search' in task_lower:
+            subtasks.append('scan_directory')
+            subtasks.append('filter_results')
+            subtasks.append('format_output')
+        
+        return {'subtasks': subtasks, 'task_type': task_lower[:20]}
+    
+    def plan_execution(self, task: str) -> list:
+        """Create execution plan with fallbacks"""
+        analysis = self.analyze_task(task)
+        plan = []
+        
+        for subtask in analysis['subtasks']:
+            if subtask == 'verify_path':
+                plan.append({'action': 'check_directory', 'fallback': 'create_directory'})
+            elif subtask == 'write_file':
+                plan.append({'action': 'file_write', 'fallback': 'bash_write'})
+            elif subtask == 'verify_content':
+                plan.append({'action': 'read_file', 'fallback': None})
+            elif subtask == 'verify_exists':
+                plan.append({'action': 'check_file', 'fallback': None})
+            elif subtask == 'read_content':
+                plan.append({'action': 'read_file', 'fallback': 'bash_read'})
+            elif subtask == 'edit_file':
+                plan.append({'action': 'file_edit', 'fallback': 'bash_sed'})
+            elif subtask == 'verify_changes':
+                plan.append({'action': 'verify_edit', 'fallback': None})
+            elif subtask == 'request_permission':
+                plan.append({'action': 'ask_permission', 'fallback': None})
+            elif subtask == 'delete_item':
+                plan.append({'action': 'delete_file', 'fallback': 'bash_rm'})
+            elif subtask == 'verify_deleted':
+                plan.append({'action': 'verify_not_exists', 'fallback': None})
+        
+        return plan
+    
+    def select_tool(self, task: str) -> str:
+        """Intelligent tool selection with scoring"""
+        task_lower = task.lower()
+        scoring = {}
+        
+        for tool_name, tool_info in self.tools.items():
+            desc_lower = tool_info['desc'].lower()
+            
+            # Base relevance score
+            word_matches = sum(1 for word in desc_lower.split() if word in task_lower)
+            base_score = word_matches / max(len(desc_lower.split()), 1)
+            
+            # Boost score for tools with high success rate
+            success_rate = tool_info['success_count'] / max(tool_info['success_count'] + tool_info['fail_count'], 1)
+            reliability_boost = success_rate * 0.3
+            
+            # Recent success penalty reduction
+            if tool_name in self.tool_history[-3:]:
+                base_score *= 0.8
+            
+            final_score = base_score + reliability_boost
+            scoring[tool_name] = final_score
+        
+        return max(scoring, key=scoring.get) if scoring else None
+    
+    def track_tool_usage(self, tool_name: str, success: bool):
+        """Track tool success/failure for learning"""
+        if tool_name in self.tools:
+            if success:
+                self.tools[tool_name]['success_count'] += 1
+            else:
+                self.tools[tool_name]['fail_count'] += 1
+            self.tool_history.append((tool_name, success))
+    
+    def get_fallback_strategy(self, failed_tool: str) -> str:
+        """Get alternative approach when tool fails"""
+        fallbacks = {
+            'file_write': 'bash_write',
+            'file_edit': 'bash_sed',
+            'file_read': 'bash_cat',
+            'mkdir': 'bash_mkdir',
+            'delete_file': 'bash_rm'
+        }
+        return fallbacks.get(failed_tool, 'bash_command')
+    
+    def estimate_complexity(self, task: str) -> str:
+        """Estimate task complexity"""
+        task_lower = task.lower()
+        keyword_counts = {
+            'simple': ['create', 'read', 'list'],
+            'medium': ['edit', 'modify', 'move', 'copy'],
+            'complex': ['refactor', 'restructure', 'optimize', 'parse', 'transform']
+        }
+        
+        for complexity, keywords in keyword_counts.items():
+            if any(kw in task_lower for kw in keywords):
+                return complexity
+        return 'simple'
+    
+    def execute_with_permission(self, action: str, filepath: str = None):
+        """Execute action with permission checks"""
+        if 'delete' in action.lower() and filepath:
+            if not file_perms.request_deletion_permission(filepath):
+                return f"Permission denied: {filepath}"
+        return f"Executed: {action}"
+    
+    def get_available_tools(self) -> list:
+        """List available tools"""
+        return list(self.tools.keys())
+
+agent_engine = AgentDecisionEngine()
+
 def run_as_agent():
-    """Run model as autonomous agent"""
-    global llm, chat_history
-    if not llm:
-        print(f"{R}✗ No model loaded{X}\n")
+    """Run model as autonomous agent - MUCH SMARTER with persistent mode"""
+    global llm, chat_history, api_router, HAS_API_INTEGRATION, tool_registry, agent_debug_mode
+    
+    # Check for EITHER local model OR cloud API
+    if not llm and not (HAS_API_INTEGRATION and api_router.primary_api):
+        print(f"{R}✗ No model loaded (cloud or local){X}\n")
         return
     
-    print(f"\n{O2}╔ Agent Mode ╗{X}\n")
-    print(f"{S}Model will autonomously respond and execute skills.{X}")
-    print(f"{H2}Enter goal:{X} ", end='', flush=True)
-    goal = input().strip()
+    print(f"\n{O2}╔ Agent Mode (Persistent) ╗{X}\n")
+    print(f"{S}You are now in PERSISTENT agent mode. Type 'exit' or 'quit' to leave.{X}")
+    print(f"{S}Use '/code' command to view patterns and tools.{X}\n")
     
-    if not goal:
-        return
+    agent_iterations = 0
+    failed_attempts = {}
     
-    print(f"\n{G}[Agent] Starting...{X}\n")
-    
-    context = f"You are an autonomous AI agent.\nGoal: {goal}\n"
-    if skills:
-        context += f"Available skills: {', '.join([Path(s).name for s in skills])}\n"
-    context += "Recent context:\n"
-    
-    for c in chat_history[-3:]:
-        context += f"User: {c['prompt']}\nAssistant: {c['response']}\n"
-    
-    agent_prompt = context + "\nRespond concisely with your next action:"
-    
-    try:
-        response = query(agent_prompt)
-        print(f"{O1}[Agent]{X} {G}{response}{X}\n")
-        chat_history.append({'prompt': f'[AGENT] {goal}', 'response': response})
-    except Exception as e:
-        print(f"{R}✗ Error: {str(e)[:100]}{X}\n")
+    while True:
+        print(f"{H2}Agent Goal:{X} ", end='', flush=True)
+        goal = input().strip()
+        
+        # Handle /code command in agent mode
+        if goal.startswith('/code'):
+            parts = goal.split(None, 2)
+            if len(parts) < 2 or parts[1] == '':
+                print(f"\n{O2}╔ Claude Code Patterns & Tools in Agent ╗{X}\n")
+                print(f"{S}Patterns:{X}")
+                for pattern in list(agent_executor.claude_patterns.keys())[:8]:
+                    print(f"  {H1}{pattern}{X}")
+                print(f"\n{S}Available Tools ({len(agent_executor.list_all_tools())}):{X}")
+                for tool in agent_executor.list_all_tools()[:12]:
+                    print(f"  {H1}{tool}{X}")
+                if len(agent_executor.list_all_tools()) > 12:
+                    print(f"  {S}... +{len(agent_executor.list_all_tools())-12} more{X}")
+                print(f"\n{S}Commands:{X}")
+                print(f"  /code patterns              - Show all patterns")
+                print(f"  /code tools                 - Show all tools")
+                print(f"  /code <pattern>             - Explain pattern")
+                print(f"  /code suggest <task>        - Suggest patterns")
+                print(f"  /code template <name>       - Get code template\n")
+            elif parts[1] == 'patterns':
+                print(f"\n{O2}╔ All Claude Code Patterns ╗{X}\n")
+                for pattern, desc in agent_executor.claude_patterns.items():
+                    print(f"  {H1}{pattern}{X}: {desc}")
+                print()
+            elif parts[1] == 'tools':
+                print(f"\n{O2}╔ All Tools ({len(agent_executor.list_all_tools())}) ╗{X}\n")
+                for tool in agent_executor.list_all_tools():
+                    print(f"  {H1}{tool}{X}: {agent_executor.get_tool_description(tool)}")
+                print()
+            elif parts[1] == 'template' and len(parts) == 3:
+                template = agent_executor.get_template(parts[2])
+                print(f"\n{O1}[Template: {parts[2]}]{X}\n{G}{template}{X}\n")
+            elif parts[1] == 'suggest' and len(parts) >= 3:
+                task = ' '.join(parts[2:])
+                suggested = agent_executor.suggest_claude_pattern(task)
+                print(f"\n{O1}[Suggested Patterns for: {task}]{X}\n")
+                for pattern in suggested:
+                    desc = agent_executor.claude_patterns.get(pattern, "Unknown")
+                    print(f"  {H1}{pattern}{X}: {desc}")
+                print()
+            elif len(parts) == 2 and parts[1] in agent_executor.claude_patterns:
+                explanation = agent_executor.claude_patterns[parts[1]]
+                print(f"\n{O1}[Pattern: {parts[1]}]{X}\n{G}{explanation}{X}\n")
+            else:
+                print(f"{R}Unknown /code subcommand. Use '/code' for help{X}\n")
+            continue
+        
+        if goal.lower() in ['exit', 'quit', 'bye']:
+            print(f"\n{G}✓ Exiting agent mode{X}\n")
+            break
+        
+        if not goal:
+            continue
+        
+        print(f"\n{G}[Agent] Processing goal...{X}\n")
+        agent_iterations = 0
+        failed_attempts = {}
+        
+        # Analyze task and create execution plan
+        task_analysis = agent_engine.analyze_task(goal)
+        execution_plan = agent_engine.plan_execution(goal)
+        complexity = agent_engine.estimate_complexity(goal)
+        claude_patterns = agent_executor.suggest_claude_pattern(goal)
+        
+        # Build MUCH SMARTER agent context
+        shell_name = "PowerShell" if os_executor.is_windows else "Bash"
+        plan_str = "\n".join([f"  {i+1}. {p['action']}" + (f" (fallback: {p['fallback']})" if p['fallback'] else "") for i, p in enumerate(execution_plan)])
+        patterns_str = ", ".join(claude_patterns)
+        tools_str = ", ".join(agent_executor.list_all_tools()[:15]) + f" ... (+{len(agent_executor.list_all_tools())-15} more)"
+        
+        context = f"""You are an ADVANCED autonomous AI agent with CLAUDE CODE CAPABILITIES.
+
+GOAL: {goal}
+COMPLEXITY: {complexity.upper()}
+Claude Code Patterns: {patterns_str}
+Operating System: {os_executor.os_type}
+Shell: {shell_name}
+
+CLAUDE CODE INTEGRATION:
+You have access to Claude Code best practices including:
+- MCP (Model Context Protocol) tool integration
+- Artifact creation and file management
+- Multi-turn agentic workflows
+- Structured JSON data handling
+- Error recovery strategies
+- Vision/Image analysis capabilities
+- Web search and API integration
+- Advanced bash/command execution
+
+EXECUTION PLAN (follow in order):
+{plan_str if plan_str else "  1. Execute goal directly"}
+
+AVAILABLE TOOLS ({len(agent_executor.list_all_tools())} total):
+{tools_str}
+
+AGENT REASONING FRAMEWORK WITH CLAUDE CODE:
+1. TASK DECOMPOSITION & PLANNING (Agentic Pattern)
+   - Break complex tasks into atomic steps
+   - Identify dependencies between steps
+   - Plan error handling & fallbacks BEFORE execution
+   - Use Claude Code structured patterns
+   
+2. INTELLIGENT DECISION MAKING (Claude Code)
+   - Analyze what needs to be done, not just how
+   - Choose best tool based on context & OS
+   - If tool fails, switch to fallback immediately
+   - Learn from failures and adapt approach
+   - FILE OPERATIONS: Always check if file exists first
+     * File exists + need to modify = use file_edit
+     * File exists + need to replace = use file_edit to clear then add (NOT overwrite)
+     * File doesn't exist = use file_write
+   - TOOL SELECTION: Consider all {len(agent_executor.list_all_tools())} available tools
+   
+3. CLAUDE CODE PATTERN APPLICATION
+   - Use artifact_creation for file generation
+   - Use structured_output for JSON/data
+   - Use error_recovery for graceful fallbacks
+   - Use vision for image analysis
+   - Use web_search for external data
+   - Use bash_execution for system operations
+   - Use planning for multi-step workflows
+   
+4. REQUIREMENT UNDERSTANDING
+   - "Add dummy text" = realistic placeholder (Lorem ipsum, not word "dummy")
+   - HTML files = complete structure with DOCTYPE, head, body, CSS
+   - File edits = modify only specified sections, preserve rest
+   - Code files = follow best practices (formatted, documented, typed)
+   - Data operations = validate and transform correctly
+   - Real content, not placeholder strings
+   
+5. EXECUTION DISCIPLINE
+   - Verify preconditions before each action (file exists? permission granted?)
+   - Execute ACTUAL commands, not talk about them
+   - Confirm success immediately with verification commands
+   - Never assume success, always verify
+   
+6. ERROR RECOVERY STRATEGY (Claude Code Error Pattern)
+   - First failure: Try fallback approach
+   - Second failure: Analyze root cause and use completely different method
+   - Third failure: Request clarification or context from user
+   - Max 3 attempts per subtask before escalating
+   - Use smart error detection and recovery
+   
+7. CONTENT QUALITY STANDARDS (Claude Code)
+   - HTML: Valid structure, semantic tags, inline CSS
+   - Code: Proper formatting, type hints, docstrings, no warnings
+   - Text: Proper formatting, meaningful content, no placeholder words
+   - JSON: Valid syntax, proper indentation, clear schema
+   - CSV/Data: Correct delimiters, headers, proper types
+   - Files: Complete & ready to use, not partial/incomplete
+   
+8. VERIFICATION & COMPLETION
+   - After each major step: Verify result with read/list commands
+   - Show proof of completion (file contents, directory listing, etc)
+   - Only mark COMPLETE when verified
+   - Continue until goal is FULLY satisfied
+
+CRITICAL RULES:
+- NEVER use generic "test" or "dummy" content
+- ALWAYS verify file creation with actual reads
+- FILE PERMISSION RULES (no user prompts for these):
+  * file_write on new file = NO permission needed
+  * file_edit on existing file = NO permission needed
+  * file_delete or rm command = ASK permission only if explicitly deleting
+- Use OS-native commands ({shell_name})
+- Failed operations = try fallback, not retry same approach
+- Show command output as proof of success
+- DO NOT overwrite files unnecessarily - use file_edit instead
+- Consider ALL available tools before defaulting to bash
+
+CLAUDE CODE TOOL TEMPLATES:
+{chr(10).join([f"  {name}: {agent_executor.get_template(name)}" for name in list(agent_executor.code_templates.keys())[:10]])}
+
+Available Tools: {', '.join(tool_registry.list_tools()) if tool_registry else 'none'}
+
+COMMAND FORMATS:
+  <tool_call>tool_name param1=value1 param2=value2</tool_call>
+  <action>shell command here</action>
+
+EXAMPLES OF CORRECT EXECUTION:
+✓ CORRECT: <tool_call>file_write path=page.html content="<!DOCTYPE html>...</html>"</tool_call>
+✗ WRONG: "I will create an HTML file" (no action taken)
+✓ CORRECT: <action>{"Get-Content page.html" if os_executor.is_windows else "cat page.html"}</action> (verify)
+✗ WRONG: <action>cat page.html</action> (wrong shell for Windows)
+✓ CORRECT: Edit only changed section, preserve existing content
+✗ WRONG: Replace entire file when only editing one part
+
+WRONG: "I will add dummy text"
+RIGHT: <tool_call>file_write path=file.txt content="Lorem ipsum dolor sit amet, consectetur adipiscing elit..."</tool_call>
+
+Recent context from conversation:
+"""
+        
+        for c in chat_history[-3:]:
+            context += f"User: {c['prompt']}\nAssistant: {c['response']}\n"
+        
+        context += "\nNow, intelligently accomplish this goal. Be thorough and create quality content."
+        
+        agent_prompt = context
+        max_agent_iterations = 8
+        goal_completed = False
+        
+        try:
+            while agent_iterations < max_agent_iterations:
+                agent_iterations += 1
+                if agent_debug_mode:
+                    print(f"{S}[Agent Iteration {agent_iterations}]{X}")
+                
+                response = query(agent_prompt)
+                
+                # Only show if debug or if thinking (no tool calls)
+                if agent_debug_mode or ('<tool_call>' not in response and '<action>' not in response):
+                    print(f"{O1}[Agent]{X} {response}\n")
+                
+                # Check if agent made tool calls
+                if '<tool_call>' in response or '<action>' in response:
+                    tool_executed = False
+                    success_this_iteration = True
+                    
+                    # Extract and execute tool calls
+                    if '<tool_call>' in response:
+                        start = response.find('<tool_call>') + 11
+                        end = response.find('</tool_call>')
+                        tool_call = response[start:end].strip()
+                        
+                        parts = tool_call.split(None, 1)
+                        tool_name = parts[0]
+                        
+                        # Smart permission check using tool matrix
+                        if agent_executor.needs_permission(tool_name):
+                            # Get operation target
+                            filepath = None
+                            if 'path=' in tool_call:
+                                filepath = tool_call.split('path=')[1].split()[0].strip('"\'')
+                            
+                            # Determine operation type for permission message
+                            if 'delete' in tool_name.lower() or 'rm ' in tool_call.lower():
+                                op_type = "delete"
+                            elif 'push' in tool_name.lower() or 'reset' in tool_name.lower():
+                                op_type = "git operation"
+                            elif 'db_delete' in tool_name or 'db_update' in tool_name or 'db_insert' in tool_name:
+                                op_type = "database modification"
+                            else:
+                                op_type = "operation"
+                            
+                            if not file_perms.request_deletion_permission(filepath or 'unspecified', op_type):
+                                print(f"{R}✗ {op_type.capitalize()} cancelled by user{X}\n")
+                                agent_prompt = context + f"\n{op_type.capitalize()} cancelled by user. Choose different approach."
+                                continue
+                        # No permission needed for read/create/transform operations
+                        
+                        # Select best tool based on task
+                        selected = agent_engine.select_tool(goal)
+                        if selected and agent_debug_mode:
+                            print(f"{S}[Tool Selection] {selected}{X}\n")
+                        params_str = parts[1] if len(parts) > 1 else ""
+                        
+                        # Parse params with quote stripping and proper parsing
+                        params = {}
+                        # Handle quoted strings properly
+                        import shlex
+                        try:
+                            tokens = shlex.split(params_str)
+                            for token in tokens:
+                                if '=' in token:
+                                    key, val = token.split('=', 1)
+                                    params[key] = val
+                        except:
+                            # Fallback to simple split
+                            for param in params_str.split():
+                                if '=' in param:
+                                    key, val = param.split('=', 1)
+                                    params[key] = _strip_quotes(val)
+                        
+                        tool_call_signature = f"{tool_name}({', '.join(f'{k}={v[:20]}...' if len(str(v)) > 20 else f'{k}={v}' for k, v in params.items())})"
+                        
+                        # Check retry limit with intelligent fallback
+                        if tool_call_signature in failed_attempts and failed_attempts[tool_call_signature] >= 1:
+                            if agent_debug_mode:
+                                print(f"{R}[Tool Failed Once]{X} Switching to fallback approach\n")
+                            fallback = agent_engine.get_fallback_strategy(tool_name)
+                            agent_prompt = context + f"\nTool '{tool_name}' failed. Use fallback: {fallback}. Analyze WHY it failed and use different approach."
+                            failed_attempts[tool_call_signature] = failed_attempts.get(tool_call_signature, 0) + 1
+                        elif tool_call_signature in failed_attempts and failed_attempts[tool_call_signature] >= 2:
+                            if agent_debug_mode:
+                                print(f"{R}[Max Retries Exceeded]{X} Requesting clarification\n")
+                            agent_prompt = context + f"\nTool '{tool_name}' failed twice. Either ask for clarification or completely redesign the approach."
+                            failed_attempts[tool_call_signature] = failed_attempts.get(tool_call_signature, 0) + 1
+                        else:
+                            if tool_registry:
+                                try:
+                                    result = tool_registry.dispatch(tool_name, **params)
+                                    
+                                    if isinstance(result, dict) and result.get('success') == False:
+                                        error_msg = result.get('error', 'Unknown error')
+                                        if agent_debug_mode:
+                                            print(f"{R}[Tool Error]{X} {error_msg}\n")
+                                        
+                                        # Track failure for learning
+                                        agent_engine.track_tool_usage(tool_name, False)
+                                        
+                                        if 'File exists' in error_msg or 'already exists' in error_msg:
+                                            if agent_debug_mode:
+                                                print(f"{S}[Already Exists]{X} Switching to edit\n")
+                                            agent_prompt = context + f"\nFile already exists. Switch to file_edit to modify it."
+                                            failed_attempts[tool_call_signature] = 0
+                                        else:
+                                            fallback = agent_engine.get_fallback_strategy(tool_name)
+                                            agent_prompt = context + f"\nTool failed: {error_msg}\nFallback: Try {fallback} instead."
+                                            failed_attempts[tool_call_signature] = failed_attempts.get(tool_call_signature, 0) + 1
+                                        success_this_iteration = False
+                                    else:
+                                        # Track success for learning
+                                        agent_engine.track_tool_usage(tool_name, True)
+                                        
+                                        if agent_debug_mode:
+                                            print(f"{G}[Tool Success]{X} {result}\n")
+                                        agent_prompt = context + f"\nAction succeeded. Now verify result with read/list command and continue toward goal completion."
+                                        failed_attempts[tool_call_signature] = 0
+                                        goal_completed = True
+                                    
+                                    tool_executed = True
+                                except Exception as e:
+                                    agent_engine.track_tool_usage(tool_name, False)
+                                    if agent_debug_mode:
+                                        print(f"{R}[Tool Exception]{X} {str(e)}\n")
+                                    fallback = agent_engine.get_fallback_strategy(tool_name)
+                                    agent_prompt = context + f"\nTool crashed: {str(e)[:50]}\nUse fallback {fallback} or redesign approach."
+                                    failed_attempts[tool_call_signature] = failed_attempts.get(tool_call_signature, 0) + 1
+                                    success_this_iteration = False
+                            else:
+                                # FORCE file creation if no tool registry
+                                if 'file_write' in tool_name or 'html' in tool_call.lower():
+                                    filepath = params.get('path', '')
+                                    content = params.get('content', '')
+                                    if filepath and content:
+                                        # Check if file exists before writing
+                                        import os
+                                        if os.path.exists(filepath):
+                                            # File exists - use edit instead of overwrite
+                                            if agent_debug_mode:
+                                                print(f"{S}[File Exists]{X} Using edit instead of overwrite\n")
+                                            agent_prompt = context + f"\nFile '{filepath}' already exists. Use file_edit to modify specific sections instead of overwriting."
+                                        else:
+                                            # File doesn't exist - safe to write
+                                            success, msg = os_executor.write_file(filepath, content)
+                                            if success:
+                                                print(f"{G}✓ File created: {filepath}{X}\n")
+                                                goal_completed = True
+                                            else:
+                                                if agent_debug_mode:
+                                                    print(f"{R}Write failed: {msg}{X}\n")
+                    
+                    # Handle commands (bash/powershell/cmd)
+                    if '<action>' in response:
+                        start = response.find('<action>') + 8
+                        end = response.find('</action>')
+                        command = response[start:end].strip()
+                        
+                        if agent_debug_mode:
+                            print(f"{S}[Executing]{X} {command}")
+                        
+                        success, result = os_executor.run_command(command)
+                        
+                        if success:
+                            if agent_debug_mode:
+                                print(f"{G}[Output]{X} {result[:200]}\n")
+                            
+                            # If file creation command, mark goal progress
+                            if any(x in command.lower() for x in ['cat >', 'out-file', 'write', '>>']):
+                                goal_completed = True
+                                agent_prompt = context + f"\nFile operation completed. Verify file content and continue toward goal."
+                            else:
+                                agent_prompt = context + f"\nCommand output: {result}\nContinue toward goal."
+                        else:
+                            if agent_debug_mode:
+                                print(f"{R}[Command Failed]{X} {result}\n")
+                            agent_prompt = context + f"\nCommand failed: {result}\nTry different approach."
+                        
+                        tool_executed = True
+                    
+                    if not tool_executed and agent_debug_mode:
+                        print(f"{R}[Parse Error]{X} Could not parse tool calls\n")
+                else:
+                    # No tool calls - agent completed or is thinking
+                    # Check if agent says it's done
+                    response_lower = response.lower()
+                    if any(phrase in response_lower for phrase in ['completed', 'done', 'finished', 'accomplished', 'created', 'ready', 'file has been', 'successfully', 'html file', 'paragraph']):
+                        # FORCE verification for file operations
+                        if 'html' in goal.lower() or 'file' in goal.lower():
+                            agent_prompt = context + f"\nAgent reported: {response}\nNOW verify file exists with bash command: ls -la <filepath> and cat <filepath> to show the actual content."
+                        else:
+                            print(f"{G}✓ Goal Completed{X}\n")
+                            goal_completed = True
+                            break
+                    else:
+                        # Agent is providing info, continue
+                        agent_prompt = context + f"\nAgent thinking: {response}\nNow execute actions to accomplish the goal. Use bash or file_write to create files."
+                
+                chat_history.append({'prompt': f'[AGENT] {goal}', 'response': response})
+            
+            if agent_iterations >= max_agent_iterations:
+                print(f"{S}[Max Iterations Reached]{X} Goal may not be fully complete\n")
+        
+        except KeyboardInterrupt:
+            print(f"\n{S}[Interrupted by user]{X}\n")
+        except Exception as e:
+            print(f"{R}✗ Error: {str(e)[:100]}{X}\n")
+            structured_logger.error('agent_execution_failed', error=str(e))
 
 
 def setup_freerange():
@@ -3773,18 +4699,47 @@ class LayeredAgentSystem:
         }
 
 class SubAgent:
-    """Specialized AI sub-agent for specific tasks"""
-    def __init__(self, name, role, system_prompt, model_path=None):
+    """Specialized AI sub-agent for specific tasks - NOW WITH CLOUD MODEL SUPPORT"""
+    def __init__(self, name, role, system_prompt, model_path=None, cloud_provider=None, cloud_model=None):
         self.name = name
         self.role = role
         self.system_prompt = system_prompt
         self.model = None
         self.model_path = model_path or globals().get('model_path')  # Fixed: Use global model_path as fallback
+        self.cloud_provider = cloud_provider  # NEW: Cloud provider (anthropic, openai, google)
+        self.cloud_model = cloud_model  # NEW: Cloud model name
+        self.api_client = None  # NEW: Store cloud API client for agents
         self.conversation = []
     
     def initialize(self):
-        """Load model for this agent"""
+        """Load model for this agent - supports cloud providers, local GGUF, and shared LLM"""
         try:
+            # PRIORITY 1: Cloud model if specified
+            if self.cloud_provider and self.cloud_model:
+                try:
+                    if self.cloud_provider.lower() == 'anthropic':
+                        import anthropic
+                        self.api_client = anthropic.Anthropic()
+                        self.model = f"cloud:{self.cloud_provider}:{self.cloud_model}"
+                        structured_logger.log('agent_cloud_init', agent=self.name, provider=self.cloud_provider, model=self.cloud_model)
+                        return True
+                    elif self.cloud_provider.lower() == 'openai':
+                        import openai
+                        self.api_client = openai.OpenAI()
+                        self.model = f"cloud:{self.cloud_provider}:{self.cloud_model}"
+                        structured_logger.log('agent_cloud_init', agent=self.name, provider=self.cloud_provider, model=self.cloud_model)
+                        return True
+                    elif self.cloud_provider.lower() == 'google':
+                        import google.generativeai as genai
+                        self.api_client = genai
+                        self.model = f"cloud:{self.cloud_provider}:{self.cloud_model}"
+                        structured_logger.log('agent_cloud_init', agent=self.name, provider=self.cloud_provider, model=self.cloud_model)
+                        return True
+                except ImportError:
+                    structured_logger.error('cloud_agent_failed', agent=self.name, provider=self.cloud_provider, reason='library_not_installed')
+                    print(f"{S}Cloud provider library not installed, falling back to local model{X}")
+            
+            # PRIORITY 2: Local model file
             if self.model_path:
                 model_name = Path(self.model_path).name
                 cpu_count = os.cpu_count() or 4
@@ -3802,16 +4757,20 @@ class SubAgent:
                         model_path=str(Path(self.model_path).parent),
                         allow_download=False
                     )
+                structured_logger.log('agent_local_init', agent=self.name, model_path=self.model_path)
                 return True
-            else:
-                self.model = llm
-                return llm is not None
+            
+            # PRIORITY 3: Use shared global LLM
+            self.model = llm
+            structured_logger.log('agent_shared_init', agent=self.name)
+            return llm is not None
         except Exception as e:
+            structured_logger.error('agent_init_failed', agent=self.name, error=str(e))
             print(f"{R}✗ Agent init failed: {str(e)[:50]}{X}")
             return False
     
     def execute(self, task, context=''):
-        """Execute task with agent specialization"""
+        """Execute task with agent specialization - NOW SUPPORTS CLOUD MODELS"""
         global ollama_mode, llm_model_name
         
         if not self.model and not llm and not ollama_mode:
@@ -3820,7 +4779,51 @@ class SubAgent:
         full_prompt = f"{self.system_prompt}\n\nContext: {context}\n\nTask: {task}"
         
         try:
-            # Use Ollama if available
+            # PRIORITY 1: Cloud model via API
+            if self.api_client and isinstance(self.model, str) and self.model.startswith('cloud:'):
+                try:
+                    parts = self.model.split(':')
+                    provider = parts[1] if len(parts) > 1 else ''
+                    model_name = parts[2] if len(parts) > 2 else ''
+                    
+                    if provider == 'anthropic':
+                        response = self.api_client.messages.create(
+                            model=model_name or 'claude-3-5-sonnet-20241022',
+                            max_tokens=max_tokens,
+                            system=self.system_prompt,
+                            messages=[{"role": "user", "content": f"{context}\n\n{task}"}]
+                        )
+                        result = response.content[0].text
+                        self.conversation.append({'task': task, 'response': result})
+                        structured_logger.log('agent_cloud_exec', agent=self.name, provider='anthropic')
+                        return result.strip() if result.strip() else f"{R}No response{X}"
+                    
+                    elif provider == 'openai':
+                        response = self.api_client.chat.completions.create(
+                            model=model_name or 'gpt-4-turbo',
+                            max_tokens=max_tokens,
+                            temperature=temp,
+                            system_prompt=self.system_prompt,
+                            messages=[{"role": "user", "content": f"{context}\n\n{task}"}]
+                        )
+                        result = response.choices[0].message.content
+                        self.conversation.append({'task': task, 'response': result})
+                        structured_logger.log('agent_cloud_exec', agent=self.name, provider='openai')
+                        return result.strip() if result.strip() else f"{R}No response{X}"
+                    
+                    elif provider == 'google':
+                        self.api_client.configure(api_key=os.getenv('GOOGLE_API_KEY', ''))
+                        model_obj = self.api_client.GenerativeModel(model_name or 'gemini-pro')
+                        response = model_obj.generate_content(full_prompt)
+                        result = response.text
+                        self.conversation.append({'task': task, 'response': result})
+                        structured_logger.log('agent_cloud_exec', agent=self.name, provider='google')
+                        return result.strip() if result.strip() else f"{R}No response{X}"
+                except Exception as e:
+                    structured_logger.error('agent_cloud_exec_failed', agent=self.name, error=str(e))
+                    print(f"{S}Cloud execution failed, falling back to local{X}")
+            
+            # PRIORITY 2: Use Ollama if available
             if ollama_mode and HAS_OLLAMA:
                 response = requests.post(
                     "http://localhost:11434/api/generate",
@@ -3838,7 +4841,7 @@ class SubAgent:
                     self.conversation.append({'task': task, 'response': result})
                     return result.strip() if result.strip() else f"{R}No response{X}"
             
-            # Fallback to local model
+            # PRIORITY 3: Fallback to local model
             model_to_use = self.model or llm
             response = model_to_use.generate(
                 full_prompt,
@@ -4215,20 +5218,47 @@ class HierarchicalSubAgent:
         return results
     
     def execute(self, task, parent_context=''):
-        """Execute task, escalate to children if needed"""
-        # Execute at this level
+        """ENHANCEMENT: Actually executes hierarchical sub-agents with real results"""
+        global llm, api_router, HAS_API_INTEGRATION
+        
+        # Build execution prompt
         prompt = f"{self.system_prompt}\n\nTask: {task}"
         if parent_context:
             prompt += f"\n\nParent Context: {parent_context}"
         
-        if self.children and len(task) > 100:  # Complex task → delegate
-            child_results = self.delegate_to_children(task)
-            synthesis = f"Synthesizing results from {len(self.children)} sub-agents: {child_results}"
-            self.conversation.append({'task': task, 'synthesis': synthesis})
-            return synthesis
-        else:
-            self.conversation.append({'task': task})
-            return f"[{self.level}] Executed: {task[:50]}"
+        try:
+            # Initialize model if needed
+            if not self.model:
+                if HAS_API_INTEGRATION and api_router.primary_api:
+                    self.model = 'api_client'
+                else:
+                    self.model = llm
+            
+            # ACTUAL EXECUTION: Query model with task
+            actual_result = ""
+            if self.model == 'api_client' and api_router:
+                actual_result = api_router.query(prompt, provider=api_router.primary_api)
+            elif isinstance(self.model, str):
+                # Use query function for shared global model
+                actual_result = query(prompt, use_context=False)
+            else:
+                # Direct model call
+                actual_result = self.model(prompt, max_tokens=512, temperature=0.7) if self.model else ""
+            
+            # Delegate to children if complex task and children exist
+            if self.children and len(task) > 100:
+                child_results = self.delegate_to_children(task)
+                synthesis = f"Hierarchical synthesis:\n{actual_result}\n\nChild agent results: {json.dumps(child_results, indent=2)}"
+                self.conversation.append({'task': task, 'result': actual_result, 'child_results': child_results, 'synthesis': synthesis})
+                structured_logger.log('hierarchical_exec', agent=self.name, level=self.level, children=len(self.children))
+                return synthesis
+            else:
+                self.conversation.append({'task': task, 'result': actual_result})
+                structured_logger.log('hierarchical_exec', agent=self.name, level=self.level, result_length=len(actual_result))
+                return actual_result.strip() if actual_result else f"[Level {self.level}] Task executed"
+        except Exception as e:
+            structured_logger.error('hierarchical_exec_failed', agent=self.name, error=str(e))
+            return f"[Level {self.level}] Execution failed: {str(e)[:50]}"
     
     def get_hierarchy(self):
         """Get agent tree structure"""
@@ -4340,7 +5370,8 @@ def main():
  if not setup():
   return
  
- print(f"{O2}Model: {O1}{Path(model_path).stem if model_path else 'None'}{X}\n")
+ model_display = Path(model_path).stem if model_path else (f'{api_router.primary_api}/{api_router.selected_models.get(api_router.primary_api, "?")}' if api_router.primary_api else 'None')
+ print(f"{O2}Model: {O1}{model_display}{X}\n")
  
  while True:
   try:
@@ -4364,7 +5395,8 @@ def main():
    
    if inp=='/setup':
     if setup():
-     print(f"{O2}Model: {O1}{Path(model_path).stem if model_path else 'None'}{X}\n")
+     model_display = Path(model_path).stem if model_path else (f'{api_router.primary_api}/{api_router.selected_models.get(api_router.primary_api, "?")}' if api_router.primary_api else 'None')
+     print(f"{O2}Model: {O1}{model_display}{X}\n")
     continue
    
    if inp=='/config':
@@ -5125,22 +6157,7 @@ def main():
       print(f"{R}No specialist found{X}\n")
     continue
    
-   if inp.startswith('/code'):
-    parts = inp.split(None, 2)
-    if len(parts) < 2:
-     print(f"\n{O2}╔ Claude Code Knowledge ╗{X}\n")
-     print(f"{S}Available patterns:{X}")
-     for pattern in claude_code_knowledge.patterns.keys():
-      print(f"  {H1}{pattern}{X}")
-     print(f"\n{S}Usage: /code <pattern> or /code template <name>{X}\n")
-    elif parts[1] == 'template' and len(parts) == 3:
-     template = claude_code_knowledge.get_template(parts[2])
-     print(f"\n{O1}[Template: {parts[2]}]{X}\n{G}{template}{X}\n")
-    elif len(parts) == 2:
-     explanation = claude_code_knowledge.explain_pattern(parts[1])
-     print(f"\n{O1}[Pattern: {parts[1]}]{X}\n{G}{explanation}{X}\n")
-    continue
-   
+
    if inp.startswith('/delegate'):
     print(f"\n{O2}╔ Multi-Agent Delegation ╗{X}\n")
     print(f"{H2}Task to delegate:{X} ", end='', flush=True)
@@ -5184,8 +6201,38 @@ def main():
      print()
     continue
    
-   if inp=='/agent':
-    run_as_agent()
+   if inp.startswith('/agent'):
+    parts = inp.split(None, 1)
+    if len(parts) == 1 or parts[1] == '':
+     run_as_agent()
+    elif parts[1] == 'tools':
+     print(f"\n{O2}╔ Agent Tools ({len(agent_executor.list_all_tools())}) ╗{X}\n")
+     for tool in agent_executor.list_all_tools():
+      print(f"  {H1}{tool}{X}: {agent_executor.get_tool_description(tool)}")
+     print()
+    elif parts[1] == 'patterns':
+     print(f"\n{O2}╔ Agent Claude Code Patterns ╗{X}\n")
+     for pattern, desc in agent_executor.claude_patterns.items():
+      print(f"  {H1}{pattern}{X}: {desc}")
+     print()
+    elif parts[1] == 'info':
+     print(f"\n{O2}╔ Agent Capabilities ╗{X}\n")
+     print(f"{H1}Available Tools:{X} {len(agent_executor.list_all_tools())}")
+     print(f"{H1}Claude Code Patterns:{X} {len(agent_executor.claude_patterns)}")
+     print(f"{H1}Code Templates:{X} {len(agent_executor.code_templates)}")
+     print(f"{H1}Max Iterations:{X} 8")
+     print(f"{H1}Error Recovery:{X} 3 attempts per task")
+     print(f"{H1}OS Support:{X} Windows, Linux, macOS")
+     print(f"{H1}Shell Support:{X} PowerShell (Windows), Bash (Unix)\n")
+    else:
+     run_as_agent()
+    continue
+   
+   if inp=='/errorlog':
+    global agent_debug_mode
+    agent_debug_mode = not agent_debug_mode
+    status = "ENABLED" if agent_debug_mode else "DISABLED"
+    print(f"{G}✓ Agent debug mode {status}{X}\n")
     continue
    
    if inp=='/stats':
